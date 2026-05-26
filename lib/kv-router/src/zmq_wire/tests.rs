@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rmp_serde::{from_slice, to_vec};
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, WorkerWithDpRank, compute_block_hash_for_seq,
+    KvCacheEventData, StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::filter::KvCacheSpecKind;
@@ -518,4 +518,153 @@ fn test_convert_event_bigram_emits_eagle_windows() {
         }
         other => panic!("expected Stored event, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// HostPinned-tier wire-contract tests for the "CPU" medium alias.
+//
+// vLLM's ``CPULoadStoreSpec.medium()`` returns the bare string ``"CPU"``,
+// which Dynamo treats as an alias for the canonical ``"CPU_PINNED"`` name
+// (see ``StorageTier::from_kv_medium``). These three tests pin down the
+// resulting wire-format contract for events emitted with that medium:
+//
+//   1. tier classification: ``"CPU"`` and ``"CPU_PINNED"`` both route the
+//      event into ``StorageTier::HostPinned``.
+//   2. defensive drop: an underspecified ``BlockStored`` payload
+//      (``block_size = 0`` / empty ``token_ids``) yields zero indexable
+//      blocks and bumps the unpublished-block warning counter, so the
+//      router never inserts garbage entries into the index.
+//   3. happy path: a fully-populated CPU ``BlockStored`` is decoded,
+//      routed to HostPinned, and produces one indexable block per
+//      ``block_hashes`` entry with the expected parent and tokens hashes.
+// ---------------------------------------------------------------------------
+
+/// Helper that constructs a ``BlockStored`` matching the
+/// underspecified-payload shape: medium ``"CPU"`` with placeholder
+/// ``parent_block_hash`` / ``token_ids`` / ``block_size``. Used to anchor
+/// the defensive-drop contract.
+fn underspecified_cpu_block_stored(block_hashes: Vec<u64>) -> RawKvEvent {
+    RawKvEvent::BlockStored {
+        block_hashes: block_hashes
+            .into_iter()
+            .map(BlockHashValue::Unsigned)
+            .collect(),
+        parent_block_hash: None,
+        token_ids: vec![],
+        block_size: 0,
+        medium: Some("CPU".to_string()),
+        lora_name: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    }
+}
+
+#[test]
+fn cpu_medium_alias_routes_to_host_pinned_tier() {
+    // ``"CPU"`` is accepted as an alias for the canonical
+    // ``"CPU_PINNED"`` name; both must classify as ``HostPinned`` rather
+    // than silently falling back to ``Device``.
+    assert_eq!(
+        StorageTier::from_kv_medium("CPU"),
+        Some(StorageTier::HostPinned),
+    );
+    assert_eq!(
+        StorageTier::from_kv_medium("CPU_PINNED"),
+        Some(StorageTier::HostPinned),
+    );
+
+    // End-to-end: a ``BlockStored`` whose medium is ``"CPU"`` produces a
+    // PlacementEvent in the HostPinned tier when run through the live
+    // ``convert_event`` path.
+    let raw = underspecified_cpu_block_stored(vec![201, 202, 203]);
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement_event =
+        convert_event(raw, 42, 16, WorkerWithDpRank::new(7, 0), &warning_count)
+            .expect("convert_event should produce a placement event");
+
+    assert_eq!(placement_event.placement.tier, StorageTier::HostPinned);
+}
+
+#[test]
+fn cpu_event_with_placeholder_payload_is_dropped_safely() {
+    // ``create_stored_blocks`` iterates ``num_block_tokens`` and breaks as
+    // soon as an entry differs from ``kv_block_size``. A publisher that
+    // emits ``block_size = 0`` (a known shape for legacy CPU-offload
+    // publishers, exercised here against ``kv_block_size = 16``) must
+    // therefore produce zero indexable blocks: the router rejects the
+    // payload rather than inserting garbage into the radix tree.
+    let raw = underspecified_cpu_block_stored(vec![201, 202, 203]);
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement_event =
+        convert_event(raw, 42, 16, WorkerWithDpRank::new(7, 0), &warning_count)
+            .expect("convert_event should produce a placement event");
+
+    match placement_event.event.data {
+        KvCacheEventData::Stored(store_data) => {
+            assert!(store_data.parent_hash.is_none());
+            assert!(
+                store_data.blocks.is_empty(),
+                "expected zero indexable blocks for placeholder payload, \
+                 got {}",
+                store_data.blocks.len(),
+            );
+        }
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+
+    // The unpublished-block warning counter must observe the drop so
+    // operators can detect upstream publishers emitting underspecified
+    // payloads.
+    assert!(
+        warning_count.load(Ordering::Relaxed) >= 1,
+        "expected at least one warning logged for the dropped block(s)"
+    );
+}
+
+#[test]
+fn cpu_event_with_full_payload_is_indexable() {
+    // Happy path: a fully-populated CPU ``BlockStored`` (real
+    // ``token_ids``, matching ``block_size``, explicit ``parent_block_hash``
+    // for cross-batch chain continuity) decodes into a HostPinned
+    // PlacementEvent with one indexable block per ``block_hashes`` entry.
+    let raw = RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(201), BlockHashValue::Unsigned(202)],
+        parent_block_hash: Some(BlockHashValue::Unsigned(200)),
+        token_ids: vec![10, 11, 12, 13, 14, 15, 16, 17],
+        block_size: 4,
+        medium: Some("CPU_PINNED".to_string()),
+        lora_name: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    };
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement_event = convert_event(raw, 43, 4, WorkerWithDpRank::new(7, 0), &warning_count)
+        .expect("convert_event should produce a placement event");
+
+    assert_eq!(placement_event.placement.tier, StorageTier::HostPinned);
+
+    match placement_event.event.data {
+        KvCacheEventData::Stored(store_data) => {
+            assert_eq!(
+                store_data.parent_hash,
+                Some(ExternalSequenceBlockHash(200))
+            );
+            assert_eq!(store_data.blocks.len(), 2);
+            assert_eq!(store_data.blocks[0].block_hash, ExternalSequenceBlockHash(201));
+            assert_eq!(store_data.blocks[1].block_hash, ExternalSequenceBlockHash(202));
+        }
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+
+    assert_eq!(
+        warning_count.load(Ordering::Relaxed),
+        0,
+        "no blocks should be dropped when block_size matches kv_block_size"
+    );
 }
