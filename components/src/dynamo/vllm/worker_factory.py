@@ -413,6 +413,27 @@ class WorkerFactory:
         )
         shutdown_endpoints.append(perf_endpoint)
 
+        # When the engine is configured with RemoteG2OffloadingSpec, the
+        # vLLM EngineCore subprocess has bound a ZMQ REP socket for KV-P2P
+        # resolve/release/metadata. Bridge it to the dynamo runtime so peer
+        # workers can reach us via client.direct(...). Kept in scope until
+        # graceful shutdown so the socket stays alive.
+        remote_g2_rpc_handle = None
+        from .args import _uses_remote_g2_offloading
+
+        if _uses_remote_g2_offloading(config.engine_args):
+            from .kv_p2p import setup_source_rpc_endpoints
+
+            remote_g2_rpc_handle = await setup_source_rpc_endpoints(
+                runtime, config.namespace, config.component
+            )
+            if remote_g2_rpc_handle is None:
+                logger.warning(
+                    "RemoteG2OffloadingSpec is configured but the engine "
+                    "REP socket never appeared; KV-P2P endpoints not "
+                    "registered for this worker."
+                )
+
         try:
             logger.debug("Starting serve_endpoint for decode worker")
 
@@ -623,6 +644,22 @@ class WorkerFactory:
                 config.served_model_name or config.model,
             ),
         ]
+
+        remote_g2_rpc_handle = None
+        from .args import _uses_remote_g2_offloading
+
+        if _uses_remote_g2_offloading(config.engine_args):
+            from .kv_p2p import setup_source_rpc_endpoints
+
+            remote_g2_rpc_handle = await setup_source_rpc_endpoints(
+                runtime, config.namespace, config.component
+            )
+            if remote_g2_rpc_handle is None:
+                logger.warning(
+                    "RemoteG2OffloadingSpec is configured but the engine "
+                    "REP socket never appeared; KV-P2P endpoints not "
+                    "registered for this prefill worker."
+                )
 
         try:
             logger.debug("Starting serve_endpoint for prefill worker")
