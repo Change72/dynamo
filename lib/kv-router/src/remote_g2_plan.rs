@@ -154,27 +154,57 @@ pub fn select_remote_g2_reuse_plan(
         };
     };
 
-    // The indexer returns `hits` as a chained continuation count: the
-    // HostPinned chain for this source extends from the position where its
-    // Device chain ended, not from position 0. Without offsetting, the plan
-    // would reference request.block_hashes[..hits] (positions 0..hits), but
-    // the actual HostPinned matches on the source cover positions
-    // [device_match, device_match + hits). The wrong hashes would land in
-    // the plan, the source's resolve_for_request would fail to find them,
-    // and the plan would be silently useless.
-    let device_match = input
+    // Plan window math.
+    //
+    // The plan covers a contiguous range [start, end) of the request's block
+    // hashes that the SOURCE has on HostPinned and that the TARGET needs to
+    // load. The right anchor for `start` is the TARGET's device-tier coverage:
+    // the target will satisfy positions [0, target_device_match) from its own
+    // GPU prefix cache (the v1 scheduler short-circuits OffloadingConnector
+    // lookup on a prefix-cache hit), so the plan only needs to cover from
+    // there onward.
+    //
+    // Using the SOURCE's device-tier coverage instead is only correct when
+    // target == source (the within-worker case the predicate already skips
+    // above), and is actively wrong for cross-worker pulls: in a co-located
+    // setup the source typically still holds the prefix on its GPU prefix
+    // cache after also offloading it, so source_device_match == request_blocks
+    // and the plan window collapses to zero — silently dropping pulls that
+    // are correct and available.
+    //
+    // The MAX with the source's host-pinned-start handles the case where the
+    // source's HostPinned chain itself begins past position 0 (an extension
+    // of its own device chain). In our patched `query_lower_tiers` we always
+    // also consider a fresh-start path for each tier, so when the source's
+    // host-pinned blocks are accessible from position 0 the chain start is 0
+    // and `target_device_match` dominates.
+    let target_device_match = input
         .tiered_matches
         .device
         .overlap_scores
         .scores
-        .get(&source)
+        .get(&input.target)
         .copied()
         .unwrap_or(0) as usize;
+    let source_hp_start = input
+        .tiered_matches
+        .lower_tier
+        .get(&StorageTier::HostPinned)
+        .and_then(|m| m.next_continuations.get(&source))
+        .map(|c| c.start_pos.saturating_sub(hits as usize))
+        .unwrap_or(0);
 
     let request_blocks = input.block_hashes.len();
-    let start = device_match.min(request_blocks);
-    let available_after_device = request_blocks.saturating_sub(start);
-    let planned_prefix_blocks = (hits as usize).min(available_after_device) as u32;
+    let start = target_device_match.max(source_hp_start).min(request_blocks);
+    let available_after_target_device = request_blocks.saturating_sub(start);
+
+    // `hits` is the number of source's host-pinned blocks measured from
+    // `source_hp_start`. The portion of those that is useful to the target
+    // is the overlap with [start, request_blocks).
+    let source_hp_end = source_hp_start.saturating_add(hits as usize);
+    let useful_source_hp = source_hp_end.saturating_sub(start);
+    let planned_prefix_blocks =
+        useful_source_hp.min(available_after_target_device) as u32;
     if planned_prefix_blocks == 0 {
         return RemoteKvReuseDecision::NoPlan {
             reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
