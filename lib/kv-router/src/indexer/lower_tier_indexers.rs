@@ -182,27 +182,75 @@ pub fn query_lower_tiers(
             continue;
         };
 
+        // Path A: extension from device coverage (and from-root for workers
+        // that the tier knows about but device didn't see). This is the
+        // existing logic and answers "how much can this worker contribute
+        // BEYOND its device chain?" — the right question when the worker is
+        // both source and target of the load.
+        let mut extension_continuations = continuations.clone();
         if let Some(&first_hash) = sequence.first() {
             let root_workers: Vec<_> = indexer.backend().root_workers(first_hash);
             for worker in root_workers.iter() {
-                continuations
+                extension_continuations
                     .entry(*worker)
                     .or_insert_with(|| LowerTierContinuation::from_root(0));
             }
         }
-
-        let tier_matches = indexer
+        let extension_matches = indexer
             .backend()
-            .query_match_details(sequence, &continuations);
-        let matched_workers = tier_matches.hits.values().filter(|&&hits| hits > 0).count();
+            .query_match_details(sequence, &extension_continuations);
+
+        // Path B: fresh start (from position 0) for every worker the tier
+        // knows about. This is the right question when target ≠ source: a
+        // remote target asking "what does worker W have on host-pinned" must
+        // not have its view of W's host-pinned suppressed by W's own device
+        // chain coverage. Without this, when target=W2 wants to pull blocks
+        // that W1 has on host-pinned, the indexer would report 0 hits for W1
+        // whenever W1 ALSO happens to still hold the prefix on its GPU prefix
+        // cache (which is the common case — vLLM emits BlockRemoved only on
+        // actual GPU prefix-cache eviction, which doesn't fire under light
+        // load).
+        let fresh_continuations: std::collections::HashMap<_, _> = if let Some(
+            &first_hash,
+        ) = sequence.first()
+        {
+            indexer
+                .backend()
+                .root_workers(first_hash)
+                .into_iter()
+                .map(|w| (w, LowerTierContinuation::from_root(0)))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+        let fresh_matches = indexer
+            .backend()
+            .query_match_details(sequence, &fresh_continuations);
+
+        // Merge: per worker take whichever path yields more hits. The merge
+        // is monotonic for callers that only care about per-worker hit counts
+        // (e.g. the remote-G2 plan predicate at `select_remote_g2_reuse_plan`).
+        let mut merged = extension_matches;
+        for (worker, &fresh_hits) in &fresh_matches.hits {
+            let ext_hits = merged.hits.get(worker).copied().unwrap_or(0);
+            if fresh_hits > ext_hits {
+                merged.hits.insert(*worker, fresh_hits);
+                if let Some(c) = fresh_matches.next_continuations.get(worker).cloned() {
+                    merged.next_continuations.insert(*worker, c);
+                }
+            }
+        }
+
+        let matched_workers = merged.hits.values().filter(|&&hits| hits > 0).count();
         tracing::debug!(
             ?storage_tier,
-            queried_workers = continuations.len(),
+            queried_workers_extension = extension_continuations.len(),
+            queried_workers_fresh = fresh_continuations.len(),
             matched_workers,
-            "Queried lower-tier indexer"
+            "Queried lower-tier indexer (cross-worker pull fallback enabled)"
         );
-        continuations = tier_matches.next_continuations.clone();
-        lower_tier_matches.insert(storage_tier, tier_matches);
+        continuations = merged.next_continuations.clone();
+        lower_tier_matches.insert(storage_tier, merged);
     }
 
     lower_tier_matches
