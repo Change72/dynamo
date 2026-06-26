@@ -382,6 +382,37 @@ def _uses_nixl_connector(engine_config: AsyncEngineArgs) -> bool:
     return False
 
 
+def _uses_remote_g2_offloading(engine_config: AsyncEngineArgs) -> bool:
+    """Check if the user-provided --kv-transfer-config selects the vLLM
+    Remote G2 KV-P2P offloading spec.
+
+    Matches when ``kv_connector=="OffloadingConnector"`` and
+    ``kv_connector_extra_config["spec_name"]=="RemoteG2OffloadingSpec"``,
+    or the equivalent nested inside ``PdConnector``.
+    """
+    kv_cfg = getattr(engine_config, "kv_transfer_config", None)
+    if kv_cfg is None:
+        return False
+
+    def _is_remote_g2_entry(connector: str, extra: dict) -> bool:
+        return (
+            connector == "OffloadingConnector"
+            and extra.get("spec_name") == "RemoteG2OffloadingSpec"
+        )
+
+    direct_extra = kv_cfg.kv_connector_extra_config or {}
+    if _is_remote_g2_entry(kv_cfg.kv_connector, direct_extra):
+        return True
+    if kv_cfg.kv_connector == "PdConnector":
+        for entry in direct_extra.get("connectors", []):
+            if isinstance(entry, dict) and _is_remote_g2_entry(
+                entry.get("kv_connector", ""),
+                entry.get("kv_connector_extra_config") or {},
+            ):
+                return True
+    return False
+
+
 def _uses_dynamo_connector(engine_config: AsyncEngineArgs) -> bool:
     """Check if the user-provided --kv-transfer-config uses DynamoConnector (KVBM).
 

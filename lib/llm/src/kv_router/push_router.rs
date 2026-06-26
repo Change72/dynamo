@@ -17,7 +17,7 @@ use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{KvRouter, attach_remote_kv_reuse_decision, metrics::RouterRequestMetrics},
     preprocessor::PreprocessedRequest,
     protocols::common::{
         llm_backend::LLMEngineOutput,
@@ -280,6 +280,17 @@ impl KvPushRouter {
 
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
+        // Attach the remote-G2 (KV-P2P) reuse decision computed during worker
+        // selection so the chosen worker can act on the reuse plan.
+        if let Err(error) =
+            attach_remote_kv_reuse_decision(&mut backend_input, &selection.remote_kv_reuse)
+        {
+            tracing::warn!(
+                request_id = %context_id,
+                error = %error,
+                "Failed to attach remote G2 reuse metadata"
+            );
+        }
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
 

@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    env,
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -13,6 +18,10 @@ use dynamo_kv_router::{
         BlockExtraInfo, BlockHashOptions, DpRank, LocalBlockHash, PrefillLoadHint, RouterEvent,
         RouterRequest, RouterResponse, RoutingConstraints, TokensWithHashes, WorkerConfigLike,
         WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+    },
+    remote_g2_plan::{
+        RemoteKvReuseDecision, RemoteKvReuseNoPlanReason, RemoteKvReuseSelectionInput,
+        RemoteKvReuseSelectionStats, select_remote_g2_reuse_plan,
     },
     scheduling::{
         CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, ScheduleMode,
@@ -66,6 +75,7 @@ use crate::{
         sequence::{SequenceError, SequenceRequest},
     },
     local_model::runtime_config::ModelRuntimeConfig,
+    protocols::common::preprocessor::PreprocessedRequest,
 };
 use route_lookup::{TieredLookupResult, query_tiered_matches, split_retained_block_hashes};
 
@@ -76,6 +86,7 @@ pub enum FindBestMatchOutcome {
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         routing_hashes: Option<RoutingDecisionHashes>,
+        remote_kv_reuse: RemoteKvReuseDecision,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -103,6 +114,44 @@ fn cache_hit_for_worker(
             .get(&worker)
             .copied()
             .unwrap_or(0.0),
+    }
+}
+
+const REMOTE_KV_REUSE_PLAN_TTL_MS: u64 = 30_000;
+const REMOTE_G2_REUSE_ENABLED_ENV: &str = "DYN_REMOTE_G2_REUSE_ENABLED";
+
+fn unix_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn remote_g2_reuse_enabled() -> bool {
+    env::var(REMOTE_G2_REUSE_ENABLED_ENV)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) fn attach_remote_kv_reuse_decision(
+    request: &mut PreprocessedRequest,
+    decision: &RemoteKvReuseDecision,
+) -> serde_json::Result<()> {
+    match decision {
+        RemoteKvReuseDecision::Plan { plan, .. } => {
+            if request.attach_remote_kv_reuse_plan(plan).is_ok() {
+                return Ok(());
+            }
+            request.attach_remote_kv_reuse_no_plan_reason(
+                RemoteKvReuseNoPlanReason::SerializationFailed,
+            )
+        }
+        RemoteKvReuseDecision::NoPlan { reason, .. } => {
+            request.attach_remote_kv_reuse_no_plan_reason(reason.clone())
+        }
     }
 }
 
@@ -487,6 +536,9 @@ where
         let block_hashes = tracing::info_span!("kv_router.compute_block_hashes")
             .in_scope(|| compute_block_hash_for_seq(tokens, self.block_size, hash_options));
         log_routing_input_hashes(context_id, self.block_size, tokens, &block_hashes);
+        // Retain a copy of the block hashes for the remote-G2 reuse plan: the
+        // owned `block_hashes` below is moved into `query_tiered_matches`.
+        let g2_block_hashes = block_hashes.clone();
         let hash_elapsed = start.elapsed();
         // Compute seq_hashes only if scheduler needs it for active blocks tracking
         let maybe_seq_hashes = tracing::info_span!("kv_router.compute_seq_hashes").in_scope(|| {
@@ -532,7 +584,8 @@ where
         let overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
-        drop(tiered_matches);
+        // NOTE: `tiered_matches` is intentionally kept alive past schedule() so
+        // the remote-G2 reuse selection below can inspect lower-tier matches.
         let find_matches_elapsed = start.elapsed();
 
         // Capture shared cache info for metrics before moving into schedule().
@@ -569,6 +622,91 @@ where
             }
             Err(error) => return Err(map_scheduler_error(error)),
         };
+
+        // Remote-G2 (KV-P2P) reuse plan selection. Uses the scheduler's chosen
+        // worker as the target and the retained tiered matches to find a remote
+        // host-pinned source. Always produces a decision (NoPlan when disabled).
+        let created_at_ms = unix_epoch_ms();
+        let mut remote_kv_reuse = if remote_g2_reuse_enabled() {
+            select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+                request_id: context_id.unwrap_or_default(),
+                target: response.best_worker,
+                block_hashes: &g2_block_hashes,
+                block_size_tokens: self.block_size,
+                tiered_matches: &tiered_matches,
+                created_at_ms,
+                expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
+            })
+        } else {
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::Disabled,
+                stats: RemoteKvReuseSelectionStats::default(),
+            }
+        };
+
+        // Post-selection: extract the chosen source's host-pinned chain of
+        // TRT-LLM-side block_hashes and populate the plan. The chain may
+        // come back shorter than `planned_prefix_blocks` if eviction races
+        // with our walk; in that case shrink the plan to the chain length,
+        // or demote to NoPlan if the chain is empty entirely.
+        if let RemoteKvReuseDecision::Plan {
+            plan,
+            stats: plan_stats,
+        } = &mut remote_kv_reuse
+        {
+            let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
+                plan.source_worker_id,
+                plan.source_dp_rank,
+            );
+            let chain_start = plan.start_block_index as usize;
+            let chain_end = chain_start + plan.planned_prefix_blocks as usize;
+            // Starting parent_hash for the host-pinned chain: None when the
+            // source had no device-tier matches (start == 0), otherwise the
+            // device tier's last matched block_hash for this source.
+            let parent_hash = if chain_start == 0 {
+                None
+            } else {
+                tiered_matches
+                    .device
+                    .last_matched_hashes
+                    .get(&source)
+                    .copied()
+            };
+
+            let chain = self.indexer.chain_block_hashes_for_host_pinned(
+                source,
+                parent_hash,
+                &g2_block_hashes[chain_start..chain_end],
+            );
+
+            // PROBE: emit at WARN so worker-side block_hash logs can be
+            // cross-referenced against planner output. Investigation-only
+            // until the hash plumbing is validated end-to-end.
+            tracing::warn!(
+                plan_id = %plan.plan_id,
+                source_worker_id = source.worker_id,
+                source_dp_rank = source.dp_rank,
+                requested_block_hashes = ?plan.block_hashes,
+                chain_kv_block_hashes = ?chain,
+                "PROBE remote_g2_plan kv_block_hash chain"
+            );
+
+            if chain.is_empty() {
+                let stats_copy = *plan_stats;
+                remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
+                    reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                    stats: stats_copy,
+                };
+            } else {
+                if chain.len() < chain_end - chain_start {
+                    let new_len = chain.len();
+                    plan.planned_prefix_blocks = new_len as u32;
+                    plan.block_hashes.truncate(new_len);
+                }
+                plan.kv_block_hashes = chain.into_iter().map(|h| h.0).collect();
+            }
+        }
+
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);
 
@@ -595,6 +733,10 @@ where
             m.shared_cache_beyond_blocks.observe(beyond as f64);
         }
 
+        if let Some(m) = metrics::RouterRequestMetrics::get() {
+            m.observe_remote_g2_decision(&remote_kv_reuse, self.block_size);
+        }
+
         #[cfg(feature = "bench")]
         tracing::info!(
             isl_tokens,
@@ -612,6 +754,7 @@ where
             effective_overlap_blocks: response.effective_overlap_blocks,
             cached_tokens: response.cached_tokens,
             routing_hashes,
+            remote_kv_reuse,
         })
     }
 

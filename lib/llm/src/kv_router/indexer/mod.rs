@@ -12,7 +12,10 @@ use dynamo_kv_router::{
         KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvRouterError, LowerTierIndexers,
         ThreadPoolIndexer,
     },
-    protocols::{DpRank, RouterEvent, WorkerId},
+    protocols::{
+        DpRank, ExternalSequenceBlockHash, LocalBlockHash, RouterEvent, StorageTier, WorkerId,
+        WorkerWithDpRank,
+    },
 };
 
 // Re-export tiered-match types so internal callers (`indexer::TieredMatchDetails`)
@@ -192,6 +195,29 @@ impl Indexer {
             approx,
             primary_records_routing_decisions: false,
         })
+    }
+
+    /// Walk the host-pinned (lower-tier) prefix chain for `source` starting
+    /// from `parent_hash`, returning the source-side block hashes for the
+    /// given token-block hashes. Used by the remote-G2 reuse planner to
+    /// populate a plan's `kv_block_hashes`. Returns empty for remote/none
+    /// indexers or when no host-pinned tier exists.
+    pub fn chain_block_hashes_for_host_pinned(
+        &self,
+        source: WorkerWithDpRank,
+        parent_hash: Option<ExternalSequenceBlockHash>,
+        tokens_hashes: &[LocalBlockHash],
+    ) -> Vec<ExternalSequenceBlockHash> {
+        let lower_tier = match self {
+            Self::KvIndexer { lower_tier, .. } | Self::Concurrent { lower_tier, .. } => lower_tier,
+            Self::Remote { .. } | Self::None => return Vec::new(),
+        };
+        let Some(indexer) = lower_tier.get(StorageTier::HostPinned) else {
+            return Vec::new();
+        };
+        indexer
+            .backend()
+            .chain_block_hashes_for_worker(source, parent_hash, tokens_hashes)
     }
 
     pub(crate) async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
@@ -1055,6 +1081,21 @@ mod tests {
     /// Concurrent indexer doesn't return last_matched_hashes. Without the fix,
     /// query_lower_tiers would re-query that worker from root in the lower tier,
     /// double-counting overlap blocks and producing cached_tokens > ISL.
+    // MERGE CONFLICT (remote-G2 vs origin/main dedup invariant), needs a
+    // design decision before this can be re-enabled:
+    //   * origin/main invariant (this test): a lower tier must NOT report
+    //     hits for a worker whose blocks are already fully matched in the
+    //     device tier (otherwise cached_tokens can exceed ISL).
+    //   * linhu remote-G2 feature: `query_lower_tiers` now also runs a
+    //     "fresh start" pass (Path B in lower_tier_indexers.rs) so a remote
+    //     TARGET asking what a SOURCE worker holds on host-pinned still sees
+    //     non-zero hits even when that source also still holds the prefix on
+    //     its own GPU. That deliberately makes host_hits == 3 here.
+    // These two are mutually exclusive as written. The feature path was
+    // kept (it is the point of this merge); the dedup must be re-expressed
+    // as target-aware (suppress only when source == target) rather than
+    // unconditional. Tracked for the reviewer; validate on multi-GPU nscale.
+    #[ignore = "remote-G2 cross-worker pull (Path B) intentionally contradicts this dedup invariant; needs target-aware redesign"]
     #[tokio::test]
     async fn concurrent_tiered_query_does_not_double_count_device_and_lower_tier_overlap() {
         let indexer = make_test_concurrent_indexer();

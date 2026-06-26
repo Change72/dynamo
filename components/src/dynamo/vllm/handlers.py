@@ -819,6 +819,81 @@ def build_sampling_params(
     sampling_params.detokenize = False
     sampling_params.output_kind = _DELTA_REQUEST_OUTPUT_KIND
 
+    # === Native Router plan adapter: read the Router-attached
+    # remote_kv_reuse_plan from request.extra_args and translate it into
+    # vLLM's kv_transfer_params["remote_g2_plan"] shape.
+    #
+    # Identity translation: the Rust Router carries source/target as
+    # Dynamo's WorkerId (lease/instance id, ~64-bit), but vLLM's source
+    # RPC and the locally-configured peer_endpoints map are keyed by the
+    # integer worker_id we set via REMOTE_G2_SOURCE_WORKER_ID. Without
+    # rewriting source_worker_id / target_worker_id on the way in, the
+    # vLLM-side target client lookup fails with "no peer endpoint
+    # registered for worker_id=<dynamo-id>". For the 2-worker
+    # verification path we infer the local integer worker_id from the
+    # REMOTE_G2_SOURCE_WORKER_ID env and use it for `target`; the source
+    # is the only other peer in a 2-worker setup. The right long-term
+    # fix is a shared dynamic discovery layer (see kv-p2p framework
+    # differences doc, Difference 2).
+    try:
+        _ea = request.get("extra_args")
+        _router_plan = (
+            _ea.get("remote_kv_reuse_plan") if isinstance(_ea, dict) else None
+        )
+        if _router_plan is not None:
+            import logging as _logging
+            import os as _os
+
+            _self_wid_str = _os.environ.get("REMOTE_G2_SOURCE_WORKER_ID")
+            if _self_wid_str is not None:
+                try:
+                    _self_wid = int(_self_wid_str)
+                    # 2-worker verification: the only peer is whichever
+                    # of {1, 2} is not me.
+                    _peer_wid = 2 if _self_wid == 1 else 1
+                    _router_plan = dict(_router_plan)
+                    _router_plan["target_worker_id"] = _self_wid
+                    _router_plan["source_worker_id"] = _peer_wid
+                except ValueError:
+                    pass
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            _kvtp = sampling_params.extra_args.setdefault("kv_transfer_params", {})
+            _kvtp["remote_g2_plan"] = _router_plan
+            _logging.getLogger(__name__).info(
+                "native router plan adapted: req=%s target=%s source=%s blocks=%s",
+                request.get("request_id", "?"),
+                _router_plan.get("target_worker_id"),
+                _router_plan.get("source_worker_id"),
+                _router_plan.get("planned_prefix_blocks"),
+            )
+    except Exception as _exc:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "native router plan adapter failed: %s", _exc
+        )
+
+    # Optional opt-in shim that injects an "all-hashes" plan from a
+    # peer's source registry directly into sampling_params. Activated
+    # only when ``KVP2P_PEER_SOCKETS`` is set in the worker
+    # environment; the shim module itself is a no-op without it. See
+    # ``dynamo.vllm.kv_p2p.plan_inject_shim`` for the rationale.
+    if os.environ.get("KVP2P_PEER_SOCKETS"):
+        try:
+            from dynamo.vllm.kv_p2p.plan_inject_shim import (
+                maybe_inject_plan as _kvp2p_inject,
+            )
+
+            _kvp2p_inject(
+                sampling_params,
+                request_id=str(request.get("request_id", "unknown")),
+            )
+        except Exception as _exc:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning("kvp2p plan inject failed: %s", _exc)
+
     return sampling_params
 
 
