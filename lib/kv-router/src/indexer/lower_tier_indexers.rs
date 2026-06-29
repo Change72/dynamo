@@ -250,30 +250,47 @@ pub fn query_lower_tiers(
             .backend()
             .query_match_details(sequence, &fresh_continuations);
 
-        // Merge: per worker take whichever path yields more hits. The merge
-        // is monotonic for callers that only care about per-worker hit counts
-        // (e.g. the remote-G2 plan predicate at `select_remote_g2_reuse_plan`).
-        let mut merged = extension_matches;
+        // Two views of the SAME tier query, kept separate so the two
+        // consumers do not pollute each other (see LowerTierMatchDetails):
+        //   * `hits` = Path A (extension) ONLY = the dedup'd view. A worker's
+        //     host-pinned blocks already covered by its own device chain are
+        //     suppressed. Consumed by cache-hit estimation; pins the
+        //     `does_not_double_count` invariant.
+        //   * `cross_worker_hits` = Path A merged with Path B (fresh-from-root
+        //     per worker), max per worker. The non-dedup'd view consumed ONLY
+        //     by `select_remote_g2_reuse_plan`: a remote target must see a peer
+        //     host-pinned block even when that peer still holds the prefix on
+        //     its own GPU.
+        let mut cross_worker_hits = extension_matches.hits.clone();
         for (worker, &fresh_hits) in &fresh_matches.hits {
-            let ext_hits = merged.hits.get(worker).copied().unwrap_or(0);
-            if fresh_hits > ext_hits {
-                merged.hits.insert(*worker, fresh_hits);
-                if let Some(c) = fresh_matches.next_continuations.get(worker).cloned() {
-                    merged.next_continuations.insert(*worker, c);
-                }
+            let cw = cross_worker_hits.get(worker).copied().unwrap_or(0);
+            if fresh_hits > cw {
+                cross_worker_hits.insert(*worker, fresh_hits);
             }
         }
 
-        let matched_workers = merged.hits.values().filter(|&&hits| hits > 0).count();
+        let result = LowerTierMatchDetails {
+            hits: extension_matches.hits,
+            cross_worker_hits,
+            next_continuations: extension_matches.next_continuations,
+        };
+
+        let matched_workers = result
+            .cross_worker_hits
+            .values()
+            .filter(|&&h| h > 0)
+            .count();
         tracing::debug!(
             ?storage_tier,
             queried_workers_extension = extension_continuations.len(),
             queried_workers_fresh = fresh_continuations.len(),
             matched_workers,
-            "Queried lower-tier indexer (cross-worker pull fallback enabled)"
+            "Queried lower-tier indexer (dedup hits + cross-worker view)"
         );
-        continuations = merged.next_continuations.clone();
-        lower_tier_matches.insert(storage_tier, merged);
+        // Carry Path A (dedup'd) continuations to the next tier so the dedup'd
+        // `hits` chain stays consistent across tiers (pre-remote-G2 behaviour).
+        continuations = result.next_continuations.clone();
+        lower_tier_matches.insert(storage_tier, result);
     }
 
     lower_tier_matches

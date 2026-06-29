@@ -123,7 +123,7 @@ pub fn select_remote_g2_reuse_plan(
 
     let mut saw_remote_candidate = false;
     let mut best: Option<(WorkerWithDpRank, usize)> = None;
-    for (&worker, &hits) in &host_pinned_matches.hits {
+    for (&worker, &hits) in &host_pinned_matches.cross_worker_hits {
         if worker == input.target {
             continue;
         }
@@ -253,8 +253,8 @@ mod tests {
     use crate::indexer::{LowerTierMatchDetails, MatchDetails, TieredMatchDetails};
     use crate::protocols::{LocalBlockHash, OverlapScores, StorageTier, WorkerWithDpRank};
     use crate::remote_g2_plan::{
-        REMOTE_KV_REUSE_PLAN_VERSION, RemoteKvReuseDecision, RemoteKvReuseNoPlanReason,
-        RemoteKvReusePlan, RemoteKvReuseSelectionInput, select_remote_g2_reuse_plan,
+        select_remote_g2_reuse_plan, RemoteKvReuseDecision, RemoteKvReuseNoPlanReason,
+        RemoteKvReusePlan, RemoteKvReuseSelectionInput, REMOTE_KV_REUSE_PLAN_VERSION,
     };
 
     fn test_plan() -> RemoteKvReusePlan {
@@ -296,7 +296,12 @@ mod tests {
 
         let mut lower_tier = std::collections::HashMap::new();
         let mut host_pinned = LowerTierMatchDetails::default();
+        // The plan predicate reads `cross_worker_hits`; mirror the test input
+        // into both views so dedup'd readers see the same set in unit tests.
         host_pinned.hits.extend(host_pinned_hits.iter().copied());
+        host_pinned
+            .cross_worker_hits
+            .extend(host_pinned_hits.iter().copied());
         lower_tier.insert(StorageTier::HostPinned, host_pinned);
 
         TieredMatchDetails { device, lower_tier }

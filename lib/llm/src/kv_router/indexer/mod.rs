@@ -1081,21 +1081,11 @@ mod tests {
     /// Concurrent indexer doesn't return last_matched_hashes. Without the fix,
     /// query_lower_tiers would re-query that worker from root in the lower tier,
     /// double-counting overlap blocks and producing cached_tokens > ISL.
-    // MERGE CONFLICT (remote-G2 vs origin/main dedup invariant), needs a
-    // design decision before this can be re-enabled:
-    //   * origin/main invariant (this test): a lower tier must NOT report
-    //     hits for a worker whose blocks are already fully matched in the
-    //     device tier (otherwise cached_tokens can exceed ISL).
-    //   * linhu remote-G2 feature: `query_lower_tiers` now also runs a
-    //     "fresh start" pass (Path B in lower_tier_indexers.rs) so a remote
-    //     TARGET asking what a SOURCE worker holds on host-pinned still sees
-    //     non-zero hits even when that source also still holds the prefix on
-    //     its own GPU. That deliberately makes host_hits == 3 here.
-    // These two are mutually exclusive as written. The feature path was
-    // kept (it is the point of this merge); the dedup must be re-expressed
-    // as target-aware (suppress only when source == target) rather than
-    // unconditional. Tracked for the reviewer; validate on multi-GPU nscale.
-    #[ignore = "remote-G2 cross-worker pull (Path B) intentionally contradicts this dedup invariant; needs target-aware redesign"]
+    // RESOLVED: the remote-G2 cross-worker view and this dedup invariant no
+    // longer share one field. `LowerTierMatchDetails.hits` is the dedup'd
+    // (Path A) view this test pins; the cross-worker (Path A+B) view lives in
+    // `cross_worker_hits`, read ONLY by `select_remote_g2_reuse_plan`. See the
+    // companion `concurrent_tiered_query_cross_worker_hits_reports_overlap`.
     #[tokio::test]
     async fn concurrent_tiered_query_does_not_double_count_device_and_lower_tier_overlap() {
         let indexer = make_test_concurrent_indexer();
@@ -1147,6 +1137,54 @@ mod tests {
             host_hits, 0,
             "lower-tier should not double-count blocks already matched in device tier \
              (got {host_hits} host-pinned hits for a worker with full device overlap)"
+        );
+    }
+
+    /// Companion to the dedup test: the SAME doubly-stored blocks suppressed in
+    /// the dedup'd `hits` view MUST still appear in `cross_worker_hits`, which
+    /// `select_remote_g2_reuse_plan` reads so a remote target can pull a peer
+    /// host-pinned block even when that peer also holds it on its own GPU.
+    #[tokio::test]
+    async fn concurrent_tiered_query_cross_worker_hits_reports_overlap() {
+        let indexer = make_test_concurrent_indexer();
+        let worker = WorkerWithDpRank::new(7, 0);
+
+        indexer
+            .apply_event(store_event(7, 0, 1, &[], &[11, 12, 13], StorageTier::Device))
+            .await;
+        indexer
+            .apply_event(store_event(
+                7,
+                0,
+                2,
+                &[],
+                &[11, 12, 13],
+                StorageTier::HostPinned,
+            ))
+            .await;
+        flush_indexer(&indexer).await;
+
+        let matches = indexer
+            .find_matches_by_tier(vec![
+                LocalBlockHash(11),
+                LocalBlockHash(12),
+                LocalBlockHash(13),
+            ])
+            .await
+            .unwrap();
+
+        let tier = matches
+            .lower_tier
+            .get(&StorageTier::HostPinned)
+            .expect("host-pinned tier present");
+        // Dedup'd view suppresses the device-covered worker ...
+        assert_eq!(tier.hits.get(&worker).copied().unwrap_or(0), 0);
+        // ... but the cross-worker view still reports all 3 (what the plan needs).
+        assert_eq!(
+            tier.cross_worker_hits.get(&worker).copied().unwrap_or(0),
+            3,
+            "cross_worker_hits must expose a worker host-pinned block even when \
+             its own device tier already covers it"
         );
     }
 

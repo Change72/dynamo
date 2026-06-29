@@ -198,12 +198,17 @@ impl From<WireOverlapScores> for OverlapScores {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct WireLowerTierMatchDetails {
     pub hits: Vec<(WorkerWithDpRank, usize)>,
+    /// Cross-worker (remote-G2) hits; see `LowerTierMatchDetails`. `serde(default)`
+    /// keeps it backward-compatible with peers that predate this field.
+    #[serde(default)]
+    pub cross_worker_hits: Vec<(WorkerWithDpRank, usize)>,
 }
 
 impl From<&super::lower_tier::LowerTierMatchDetails> for WireLowerTierMatchDetails {
     fn from(d: &super::lower_tier::LowerTierMatchDetails) -> Self {
         Self {
             hits: d.hits.iter().map(|(w, h)| (*w, *h)).collect(),
+            cross_worker_hits: d.cross_worker_hits.iter().map(|(w, h)| (*w, *h)).collect(),
         }
     }
 }
@@ -215,6 +220,7 @@ impl From<WireLowerTierMatchDetails> for super::lower_tier::LowerTierMatchDetail
         // the wire-inbound path.
         Self {
             hits: w.hits.into_iter().collect(),
+            cross_worker_hits: w.cross_worker_hits.into_iter().collect(),
             next_continuations: Default::default(),
         }
     }

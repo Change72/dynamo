@@ -164,7 +164,15 @@ impl LowerTierContinuation {
 
 #[derive(Debug, Clone, Default)]
 pub struct LowerTierMatchDetails {
+    /// Dedup'd (Path A) view: each worker's host-pinned hits counted only
+    /// BEYOND its own device-tier coverage. Consumed by cache-hit estimation
+    /// and pinned by the `does_not_double_count` invariant.
     pub hits: FxHashMap<WorkerWithDpRank, usize>,
+    /// Cross-worker (remote-G2) view: per-worker host-pinned hits counted from
+    /// root, NOT suppressed by the worker's own device coverage. Consumed ONLY
+    /// by `select_remote_g2_reuse_plan`, which must see a peer host-pinned
+    /// block even when that peer also still holds it on its GPU.
+    pub cross_worker_hits: FxHashMap<WorkerWithDpRank, usize>,
     pub next_continuations: FxHashMap<WorkerWithDpRank, LowerTierContinuation>,
 }
 
