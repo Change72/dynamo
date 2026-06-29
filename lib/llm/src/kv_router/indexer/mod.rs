@@ -1188,6 +1188,84 @@ mod tests {
         );
     }
 
+    /// Native-path router LOGIC, end-to-end on the REAL query path the shim
+    /// test bypasses: a real Concurrent indexer + real `query_lower_tiers`
+    /// (with the dedup/cross-worker split) feeding the real
+    /// `select_remote_g2_reuse_plan`. Proves the router emits a cross-worker
+    /// plan when the source still holds the prefix on its OWN GPU (the
+    /// co-located case that used to be suppressed), while the dedup'd estimator
+    /// view does NOT double-count. The vLLM worker half (plan -> resolve ->
+    /// NIXL pull) is validated separately by the live shim e2e.
+    #[tokio::test]
+    async fn native_remote_g2_plan_emitted_from_real_query() {
+        use dynamo_kv_router::remote_g2_plan::{
+            select_remote_g2_reuse_plan, RemoteKvReuseDecision, RemoteKvReuseSelectionInput,
+        };
+
+        let indexer = make_test_concurrent_indexer();
+        let source = WorkerWithDpRank::new(7, 0); // holds the prefix on GPU + host-pinned
+        let target = WorkerWithDpRank::new(9, 0); // has never seen the prefix
+
+        indexer
+            .apply_event(store_event(7, 0, 1, &[], &[11, 12, 13], StorageTier::Device))
+            .await;
+        indexer
+            .apply_event(store_event(
+                7,
+                0,
+                2,
+                &[],
+                &[11, 12, 13],
+                StorageTier::HostPinned,
+            ))
+            .await;
+        flush_indexer(&indexer).await;
+
+        let block_hashes = vec![
+            LocalBlockHash(11),
+            LocalBlockHash(12),
+            LocalBlockHash(13),
+        ];
+        let matches = indexer
+            .find_matches_by_tier(block_hashes.clone())
+            .await
+            .unwrap();
+
+        // Real query output: dedup'd view suppresses the source's own
+        // device-covered host-pinned blocks; the cross-worker view exposes them.
+        let hp = matches
+            .lower_tier
+            .get(&StorageTier::HostPinned)
+            .expect("host-pinned tier present");
+        assert_eq!(hp.hits.get(&source).copied().unwrap_or(0), 0);
+        assert_eq!(hp.cross_worker_hits.get(&source).copied().unwrap_or(0), 3);
+
+        // The REAL router predicate, fed the REAL tiered matches, emits a plan:
+        // target 9 pulls source 7's host-pinned prefix.
+        let decision = select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+            request_id: "native-real-query",
+            target,
+            block_hashes: &block_hashes,
+            block_size_tokens: 16,
+            tiered_matches: &matches,
+            created_at_ms: 1000,
+            expires_at_ms: 2000,
+        });
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.source_worker_id, source.worker_id);
+                assert_eq!(plan.target_worker_id, target.worker_id);
+                assert!(
+                    plan.planned_prefix_blocks > 0,
+                    "router must emit a non-empty cross-worker plan from the real \
+                     query (got {} blocks)",
+                    plan.planned_prefix_blocks
+                );
+            }
+            other => panic!("expected a remote-G2 plan from the real query, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_remove_worker_removes_lower_tier_state() {
         let indexer = make_test_concurrent_indexer();
