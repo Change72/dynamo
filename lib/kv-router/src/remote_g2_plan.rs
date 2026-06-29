@@ -250,8 +250,12 @@ mod tests {
     //                  (request × G1 × G2 combinations, plan-or-no-plan
     //                  outcome and reason).
 
-    use crate::indexer::{LowerTierMatchDetails, MatchDetails, TieredMatchDetails};
-    use crate::protocols::{LocalBlockHash, OverlapScores, StorageTier, WorkerWithDpRank};
+    use crate::indexer::{
+        LowerTierContinuation, LowerTierMatchDetails, MatchDetails, TieredMatchDetails,
+    };
+    use crate::protocols::{
+        ExternalSequenceBlockHash, LocalBlockHash, OverlapScores, StorageTier, WorkerWithDpRank,
+    };
     use crate::remote_g2_plan::{
         select_remote_g2_reuse_plan, RemoteKvReuseDecision, RemoteKvReuseNoPlanReason,
         RemoteKvReusePlan, RemoteKvReuseSelectionInput, REMOTE_KV_REUSE_PLAN_VERSION,
@@ -302,6 +306,21 @@ mod tests {
         host_pinned
             .cross_worker_hits
             .extend(host_pinned_hits.iter().copied());
+        for &(worker, hits) in host_pinned_hits {
+            let device_hit = device_hits
+                .iter()
+                .find_map(|&(device_worker, device_hit)| {
+                    (device_worker == worker).then_some(device_hit as usize)
+                })
+                .unwrap_or(0);
+            host_pinned.next_continuations.insert(
+                worker,
+                LowerTierContinuation::new(
+                    device_hit + hits,
+                    ExternalSequenceBlockHash(device_hit.saturating_add(hits) as u64),
+                ),
+            );
+        }
         lower_tier.insert(StorageTier::HostPinned, host_pinned);
 
         TieredMatchDetails { device, lower_tier }
