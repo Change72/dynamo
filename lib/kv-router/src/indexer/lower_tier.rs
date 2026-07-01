@@ -162,6 +162,19 @@ impl LowerTierContinuation {
     }
 }
 
+/// Anchor for the chain counted in [`LowerTierMatchDetails::cross_worker_hits`]:
+/// where that worker's counted host-pinned chain begins and the external hash
+/// that seeds it. The remote-G2 materializer walks the SAME chain the planner
+/// counted by seeding `chain_block_hashes_for_worker` from `parent_hash` at
+/// `start_pos` — instead of reverse-inferring the start from mixed Path-A
+/// (`next_continuations`) and Path-B (`cross_worker_hits`) views, which is
+/// wrong whenever the two paths disagree on the chain's start position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossWorkerAnchor {
+    pub start_pos: usize,
+    pub parent_hash: Option<ExternalSequenceBlockHash>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LowerTierMatchDetails {
     /// Dedup'd (Path A) view: each worker's host-pinned hits counted only
@@ -173,6 +186,10 @@ pub struct LowerTierMatchDetails {
     /// by `select_remote_g2_reuse_plan`, which must see a peer host-pinned
     /// block even when that peer also still holds it on its GPU.
     pub cross_worker_hits: FxHashMap<WorkerWithDpRank, usize>,
+    /// Per-worker anchor {start_pos, parent_hash} for the chain counted in
+    /// `cross_worker_hits`. Local-only (like `next_continuations`); not carried
+    /// on the wire. Lets the materializer walk the exact chain that was counted.
+    pub cross_worker_anchors: FxHashMap<WorkerWithDpRank, CrossWorkerAnchor>,
     pub next_continuations: FxHashMap<WorkerWithDpRank, LowerTierContinuation>,
 }
 

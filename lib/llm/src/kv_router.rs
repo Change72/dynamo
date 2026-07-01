@@ -660,24 +660,39 @@ where
             );
             let chain_start = plan.start_block_index as usize;
             let chain_end = chain_start + plan.planned_prefix_blocks as usize;
-            // Starting parent_hash for the host-pinned chain: None when the
-            // source had no device-tier matches (start == 0), otherwise the
-            // device tier's last matched block_hash for this source.
-            let parent_hash = if chain_start == 0 {
-                None
-            } else {
-                tiered_matches
-                    .device
-                    .last_matched_hashes
-                    .get(&source)
-                    .copied()
-            };
+            // Walk the source's host-pinned chain from where it ACTUALLY begins
+            // (its recorded cross-worker anchor {start_pos, parent}), then drop
+            // the leading blocks the target already covers locally. Anchoring
+            // directly at chain_start with the source's DEVICE tail is wrong
+            // whenever chain_start > source_hp_start: the parent of block
+            // chain_start is then an INTERIOR host-pinned hash, not the device
+            // tail, so the walk from (device_tail, token[chain_start]) misses
+            // and the whole chain comes back empty (NoContiguousPrefix).
+            let anchor = tiered_matches
+                .lower_tier
+                .get(&dynamo_kv_router::protocols::StorageTier::HostPinned)
+                .and_then(|m| m.cross_worker_anchors.get(&source))
+                .copied();
+            let hp_start = anchor
+                .map(|a| a.start_pos)
+                .unwrap_or(chain_start)
+                .min(chain_start);
+            let parent_hash = anchor.and_then(|a| a.parent_hash);
 
-            let chain = self.indexer.chain_block_hashes_for_host_pinned(
+            let full_chain = self.indexer.chain_block_hashes_for_host_pinned(
                 source,
                 parent_hash,
-                &g2_block_hashes[chain_start..chain_end],
+                &g2_block_hashes[hp_start..chain_end],
             );
+            // Drop [hp_start, chain_start): the prefix the target already holds.
+            // If the source's walk didn't even reach chain_start, the plan
+            // window is empty and demotes to NoContiguousPrefix below.
+            let skip = chain_start - hp_start;
+            let chain: Vec<_> = if full_chain.len() > skip {
+                full_chain[skip..].to_vec()
+            } else {
+                Vec::new()
+            };
 
             // PROBE: emit at WARN so worker-side block_hash logs can be
             // cross-referenced against planner output. Investigation-only
