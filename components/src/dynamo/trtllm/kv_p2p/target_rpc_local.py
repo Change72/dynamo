@@ -103,7 +103,8 @@ def _dispatch_resolve(
     # outer shape and reads `.result` for the flat dict.
     if not isinstance(response, dict):
         return {"ok": False, "error": f"non_dict_response:{type(response).__name__}"}
-    inner = response.get("result") if isinstance(response.get("result"), dict) else {}
+    _result = response.get("result")
+    inner = _result if isinstance(_result, dict) else {}
     lease_id = inner.get("lease_id")
     if lease_id:
         lease_map.put(str(lease_id), source_worker_id)
