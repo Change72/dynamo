@@ -189,12 +189,17 @@ pub fn select_remote_g2_reuse_plan(
         .get(&input.target)
         .copied()
         .unwrap_or(0) as usize;
+    // Where the source's counted host-pinned chain actually begins, read from
+    // the anchor recorded alongside `cross_worker_hits` (same winning path).
+    // NOT reverse-inferred as `next_continuations.start_pos - hits`: that mixes
+    // the Path-A continuation with the Path-B (from-root) hit count and is
+    // wrong whenever the two paths start at different positions.
     let source_hp_start = input
         .tiered_matches
         .lower_tier
         .get(&StorageTier::HostPinned)
-        .and_then(|m| m.next_continuations.get(&source))
-        .map(|c| c.start_pos.saturating_sub(hits as usize))
+        .and_then(|m| m.cross_worker_anchors.get(&source))
+        .map(|a| a.start_pos)
         .unwrap_or(0);
 
     let request_blocks = input.block_hashes.len();
@@ -256,7 +261,8 @@ mod tests {
     //                  outcome and reason).
 
     use crate::indexer::{
-        LowerTierContinuation, LowerTierMatchDetails, MatchDetails, TieredMatchDetails,
+        CrossWorkerAnchor, LowerTierContinuation, LowerTierMatchDetails, MatchDetails,
+        TieredMatchDetails,
     };
     use crate::protocols::{
         ExternalSequenceBlockHash, LocalBlockHash, OverlapScores, StorageTier, WorkerWithDpRank,
@@ -325,6 +331,18 @@ mod tests {
                     device_hit + hits,
                     ExternalSequenceBlockHash(device_hit.saturating_add(hits) as u64),
                 ),
+            );
+            // The planner now reads the source chain start from the recorded
+            // cross-worker anchor (was reverse-inferred as start_pos - hits).
+            // These fixtures model a source whose host-pinned chain extends its
+            // own device coverage, so its chain begins at `device_hit`.
+            host_pinned.cross_worker_anchors.insert(
+                worker,
+                CrossWorkerAnchor {
+                    start_pos: device_hit,
+                    parent_hash: (device_hit > 0)
+                        .then_some(ExternalSequenceBlockHash(device_hit as u64)),
+                },
             );
         }
         lower_tier.insert(StorageTier::HostPinned, host_pinned);
