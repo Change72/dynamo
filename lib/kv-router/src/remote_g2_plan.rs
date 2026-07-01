@@ -3,8 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::indexer::TieredMatchDetails;
-use crate::protocols::{DpRank, LocalBlockHash, StorageTier, WorkerId, WorkerWithDpRank};
+use crate::indexer::{CrossWorkerSpan, TieredMatchDetails};
+use crate::protocols::{
+    DpRank, ExternalSequenceBlockHash, LocalBlockHash, StorageTier, WorkerId, WorkerWithDpRank,
+};
 
 pub const REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY: &str = "remote_kv_reuse_plan";
 pub const REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY: &str = "remote_kv_reuse_no_plan_reason";
@@ -23,7 +25,7 @@ pub struct RemoteKvReusePlan {
     pub source_tier: StorageTier,
     pub block_hashes: Vec<LocalBlockHash>,
     /// Position in the request's prefix where `block_hashes[0]` lives.
-    /// Equals the source worker's device-tier match count at plan time.
+    /// Equals the target worker's device-tier prefix length at plan time.
     /// The target's connector uses this to verify alignment with its own
     /// `num_computed_tokens` before attaching descriptors.
     pub start_block_index: u32,
@@ -93,6 +95,10 @@ pub enum RemoteKvReuseDecision {
     Plan {
         plan: RemoteKvReusePlan,
         stats: RemoteKvReuseSelectionStats,
+        /// Exact local lower-tier span chosen by the target-aware selector.
+        /// This is router-internal materialization state and is intentionally
+        /// absent from the serialized [`RemoteKvReusePlan`].
+        selected_span: CrossWorkerSpan,
     },
     NoPlan {
         reason: RemoteKvReuseNoPlanReason,
@@ -125,28 +131,64 @@ pub fn select_remote_g2_reuse_plan(
         };
     };
 
+    let request_blocks = input.block_hashes.len();
+    let target_device_match = (input
+        .tiered_matches
+        .device
+        .overlap_scores
+        .scores
+        .get(&input.target)
+        .copied()
+        .unwrap_or(0) as usize)
+        .min(request_blocks);
+
+    // Plan selection is target-relative. Raw lower-tier hit counts cannot be
+    // ranked before the target is known: a long source span may end before the
+    // target's local prefix, while a shorter span beginning at that boundary is
+    // fully useful. A span is consumable only when it covers the very next
+    // target block; vLLM's maximal-prefix lookup stops on the first gap.
     let mut saw_remote_candidate = false;
-    let mut best: Option<(WorkerWithDpRank, usize)> = None;
-    for (&worker, &hits) in &host_pinned_matches.cross_worker_hits {
+    let mut best: Option<(WorkerWithDpRank, CrossWorkerSpan, usize)> = None;
+    for (&worker, spans) in &host_pinned_matches.cross_worker_spans {
         if worker == input.target {
             continue;
         }
-        saw_remote_candidate = true;
-        if hits == 0 {
-            continue;
+        if !spans.is_empty() {
+            saw_remote_candidate = true;
         }
-        match best {
-            None => best = Some((worker, hits)),
-            Some((best_worker, best_hits))
-                if hits > best_hits || (hits == best_hits && worker < best_worker) =>
-            {
-                best = Some((worker, hits));
+        for &span in spans {
+            let end = span.end_pos.min(request_blocks);
+            if span.start_pos > target_device_match || end <= target_device_match {
+                continue;
             }
-            Some(_) => {}
+            let useful = end - target_device_match;
+            let better = match best {
+                None => true,
+                Some((best_worker, best_span, best_useful)) => {
+                    useful > best_useful
+                        || (useful == best_useful
+                            && (worker < best_worker
+                                || (worker == best_worker
+                                    && (span.start_pos > best_span.start_pos
+                                        || (span.start_pos == best_span.start_pos
+                                            && span.parent_hash < best_span.parent_hash)))))
+                }
+            };
+            if better {
+                best = Some((worker, span, useful));
+            }
         }
     }
 
-    let Some((source, hits)) = best else {
+    // Wire-inbound results currently carry only the raw summary and no local
+    // materialization spans. Count them as candidates, but never guess their
+    // anchors: they must fail closed until remote materialization is supported.
+    saw_remote_candidate |= host_pinned_matches
+        .cross_worker_hits
+        .iter()
+        .any(|(&worker, _)| worker != input.target);
+
+    let Some((source, selected_span, useful)) = best else {
         return RemoteKvReuseDecision::NoPlan {
             reason: if saw_remote_candidate {
                 RemoteKvReuseNoPlanReason::NoContiguousPrefix
@@ -157,68 +199,9 @@ pub fn select_remote_g2_reuse_plan(
         };
     };
 
-    // Plan window math.
-    //
-    // The plan covers a contiguous range [start, end) of the request's block
-    // hashes that the SOURCE has on HostPinned and that the TARGET needs to
-    // load. The right anchor for `start` is the TARGET's device-tier coverage:
-    // the target will satisfy positions [0, target_device_match) from its own
-    // GPU prefix cache (the v1 scheduler short-circuits OffloadingConnector
-    // lookup on a prefix-cache hit), so the plan only needs to cover from
-    // there onward.
-    //
-    // Using the SOURCE's device-tier coverage instead is only correct when
-    // target == source (the within-worker case the predicate already skips
-    // above), and is actively wrong for cross-worker pulls: in a co-located
-    // setup the source typically still holds the prefix on its GPU prefix
-    // cache after also offloading it, so source_device_match == request_blocks
-    // and the plan window collapses to zero — silently dropping pulls that
-    // are correct and available.
-    //
-    // The MAX with the source's host-pinned-start handles the case where the
-    // source's HostPinned chain itself begins past position 0 (an extension
-    // of its own device chain). In our patched `query_lower_tiers` we always
-    // also consider a fresh-start path for each tier, so when the source's
-    // host-pinned blocks are accessible from position 0 the chain start is 0
-    // and `target_device_match` dominates.
-    let target_device_match = input
-        .tiered_matches
-        .device
-        .overlap_scores
-        .scores
-        .get(&input.target)
-        .copied()
-        .unwrap_or(0) as usize;
-    // Where the source's counted host-pinned chain actually begins, read from
-    // the anchor recorded alongside `cross_worker_hits` (same winning path).
-    // NOT reverse-inferred as `next_continuations.start_pos - hits`: that mixes
-    // the Path-A continuation with the Path-B (from-root) hit count and is
-    // wrong whenever the two paths start at different positions.
-    let source_hp_start = input
-        .tiered_matches
-        .lower_tier
-        .get(&StorageTier::HostPinned)
-        .and_then(|m| m.cross_worker_anchors.get(&source))
-        .map(|a| a.start_pos)
-        .unwrap_or(0);
-
-    let request_blocks = input.block_hashes.len();
-    let start = target_device_match.max(source_hp_start).min(request_blocks);
-    let available_after_target_device = request_blocks.saturating_sub(start);
-
-    // `hits` is the number of source's host-pinned blocks measured from
-    // `source_hp_start`. The portion of those that is useful to the target
-    // is the overlap with [start, request_blocks).
-    let source_hp_end = source_hp_start.saturating_add(hits as usize);
-    let useful_source_hp = source_hp_end.saturating_sub(start);
-    let planned_prefix_blocks = useful_source_hp.min(available_after_target_device) as u32;
-    if planned_prefix_blocks == 0 {
-        return RemoteKvReuseDecision::NoPlan {
-            reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
-            stats,
-        };
-    }
-    let end = start + planned_prefix_blocks as usize;
+    let start = target_device_match;
+    let end = start + useful;
+    let planned_prefix_blocks = useful as u32;
 
     RemoteKvReuseDecision::Plan {
         plan: RemoteKvReusePlan {
@@ -246,6 +229,83 @@ pub fn select_remote_g2_reuse_plan(
             kv_block_hashes: Vec::new(),
         },
         stats,
+        selected_span,
+    }
+}
+
+/// Populate a selected plan with source-side external block hashes.
+///
+/// The selector carries its exact local span outside the serialized plan. This
+/// function validates that the plan window remains inside that span, walks from
+/// the recorded parent anchor, and drops only the prefix already present on the
+/// target. Any inconsistent or stale state fails closed. If an eviction races
+/// the walk, a non-empty shorter chain shrinks the plan to the materialized
+/// prefix; an empty chain becomes `NoContiguousPrefix`.
+pub fn materialize_remote_g2_reuse_plan<F>(
+    decision: RemoteKvReuseDecision,
+    request_hashes: &[LocalBlockHash],
+    mut resolve_chain: F,
+) -> RemoteKvReuseDecision
+where
+    F: FnMut(
+        WorkerWithDpRank,
+        Option<ExternalSequenceBlockHash>,
+        &[LocalBlockHash],
+    ) -> Vec<ExternalSequenceBlockHash>,
+{
+    let (mut plan, stats, selected_span) = match decision {
+        RemoteKvReuseDecision::Plan {
+            plan,
+            stats,
+            selected_span,
+        } => (plan, stats, selected_span),
+        no_plan @ RemoteKvReuseDecision::NoPlan { .. } => return no_plan,
+    };
+
+    let fail = || RemoteKvReuseDecision::NoPlan {
+        reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+        stats,
+    };
+    let start = plan.start_block_index as usize;
+    let Some(end) = start.checked_add(plan.planned_prefix_blocks as usize) else {
+        return fail();
+    };
+    if selected_span.start_pos > start
+        || start >= end
+        || end > selected_span.end_pos
+        || end > request_hashes.len()
+        || plan.block_hashes.len() != end - start
+        || plan.block_hashes.as_slice() != &request_hashes[start..end]
+    {
+        return fail();
+    }
+
+    let source = WorkerWithDpRank::new(plan.source_worker_id, plan.source_dp_rank);
+    let full_chain = resolve_chain(
+        source,
+        selected_span.parent_hash,
+        &request_hashes[selected_span.start_pos..end],
+    );
+    let skip = start - selected_span.start_pos;
+    if full_chain.len() <= skip {
+        return fail();
+    }
+
+    let materialized = (full_chain.len() - skip).min(end - start);
+    if materialized == 0 {
+        return fail();
+    }
+    plan.planned_prefix_blocks = materialized as u32;
+    plan.block_hashes.truncate(materialized);
+    plan.kv_block_hashes = full_chain[skip..skip + materialized]
+        .iter()
+        .map(|hash| hash.0)
+        .collect();
+
+    RemoteKvReuseDecision::Plan {
+        plan,
+        stats,
+        selected_span,
     }
 }
 
@@ -261,15 +321,16 @@ mod tests {
     //                  outcome and reason).
 
     use crate::indexer::{
-        CrossWorkerAnchor, LowerTierContinuation, LowerTierMatchDetails, MatchDetails,
-        TieredMatchDetails,
+        CrossWorkerSpan, LowerTierContinuation, LowerTierMatchDetails, MatchDetails,
+        TieredMatchDetails, WireTieredMatchDetails,
     };
     use crate::protocols::{
         ExternalSequenceBlockHash, LocalBlockHash, OverlapScores, StorageTier, WorkerWithDpRank,
     };
     use crate::remote_g2_plan::{
-        select_remote_g2_reuse_plan, RemoteKvReuseDecision, RemoteKvReuseNoPlanReason,
-        RemoteKvReusePlan, RemoteKvReuseSelectionInput, REMOTE_KV_REUSE_PLAN_VERSION,
+        REMOTE_KV_REUSE_PLAN_VERSION, RemoteKvReuseDecision, RemoteKvReuseNoPlanReason,
+        RemoteKvReusePlan, RemoteKvReuseSelectionInput, materialize_remote_g2_reuse_plan,
+        select_remote_g2_reuse_plan,
     };
 
     fn test_plan() -> RemoteKvReusePlan {
@@ -312,8 +373,9 @@ mod tests {
 
         let mut lower_tier = std::collections::HashMap::new();
         let mut host_pinned = LowerTierMatchDetails::default();
-        // The plan predicate reads `cross_worker_hits`; mirror the test input
-        // into both views so dedup'd readers see the same set in unit tests.
+        // Keep the legacy summary and local materialization spans consistent
+        // in ordinary fixtures; dedicated malformed/wire tests break that
+        // relationship explicitly to verify fail-closed behavior.
         host_pinned.hits.extend(host_pinned_hits.iter().copied());
         host_pinned
             .cross_worker_hits
@@ -332,17 +394,17 @@ mod tests {
                     ExternalSequenceBlockHash(device_hit.saturating_add(hits) as u64),
                 ),
             );
-            // The planner now reads the source chain start from the recorded
-            // cross-worker anchor (was reverse-inferred as start_pos - hits).
             // These fixtures model a source whose host-pinned chain extends its
-            // own device coverage, so its chain begins at `device_hit`.
-            host_pinned.cross_worker_anchors.insert(
+            // own device coverage, so its span begins at `device_hit` and is
+            // anchored by the preceding external hash.
+            host_pinned.cross_worker_spans.insert(
                 worker,
-                CrossWorkerAnchor {
+                vec![CrossWorkerSpan {
                     start_pos: device_hit,
+                    end_pos: device_hit.saturating_add(hits),
                     parent_hash: (device_hit > 0)
                         .then_some(ExternalSequenceBlockHash(device_hit as u64)),
-                },
+                }],
             );
         }
         lower_tier.insert(StorageTier::HostPinned, host_pinned);
@@ -487,6 +549,206 @@ mod tests {
             }
             other => panic!("expected plan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn select_uses_target_relative_span_not_raw_path_winner() {
+        let hashes = block_hashes(5);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let mut matches = tiered_matches(&[(target, 3)], &[(source, 5)]);
+        matches
+            .lower_tier
+            .get_mut(&StorageTier::HostPinned)
+            .unwrap()
+            .cross_worker_spans
+            .insert(
+                source,
+                vec![
+                    CrossWorkerSpan {
+                        start_pos: 0,
+                        end_pos: 2,
+                        parent_hash: None,
+                    },
+                    CrossWorkerSpan {
+                        start_pos: 3,
+                        end_pos: 5,
+                        parent_hash: Some(ExternalSequenceBlockHash(30)),
+                    },
+                ],
+            );
+
+        let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+
+        match decision {
+            RemoteKvReuseDecision::Plan {
+                plan,
+                selected_span,
+                ..
+            } => {
+                assert_eq!(plan.start_block_index, 3);
+                assert_eq!(plan.planned_prefix_blocks, 2);
+                assert_eq!(plan.block_hashes, hashes[3..5].to_vec());
+                assert_eq!(selected_span.start_pos, 3);
+            }
+            other => panic!("expected target-useful extension plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_useful_source_beats_larger_unusable_raw_hit_count() {
+        let hashes = block_hashes(6);
+        let target = WorkerWithDpRank::new(9, 0);
+        let unusable = WorkerWithDpRank::new(7, 0);
+        let usable = WorkerWithDpRank::new(8, 0);
+        let mut matches = tiered_matches(&[(target, 3)], &[(unusable, 8), (usable, 3)]);
+        let host = matches
+            .lower_tier
+            .get_mut(&StorageTier::HostPinned)
+            .unwrap();
+        host.cross_worker_spans.insert(
+            unusable,
+            vec![CrossWorkerSpan {
+                start_pos: 0,
+                end_pos: 3,
+                parent_hash: None,
+            }],
+        );
+        host.cross_worker_spans.insert(
+            usable,
+            vec![CrossWorkerSpan {
+                start_pos: 2,
+                end_pos: 5,
+                parent_hash: Some(ExternalSequenceBlockHash(20)),
+            }],
+        );
+
+        let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.source_worker_id, usable.worker_id);
+                assert_eq!(plan.start_block_index, 3);
+                assert_eq!(plan.planned_prefix_blocks, 2);
+            }
+            other => panic!("expected usable source plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_rejects_span_separated_from_target_prefix_by_gap() {
+        let hashes = block_hashes(5);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let matches = tiered_matches(&[(source, 2)], &[(source, 2)]);
+
+        let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+
+        assert!(matches!(
+            decision,
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn select_wire_hits_without_local_span_fail_closed() {
+        let hashes = block_hashes(3);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let local_matches = tiered_matches(&[], &[(source, 3)]);
+        let wire = WireTieredMatchDetails::from(&local_matches);
+        let matches = TieredMatchDetails::from(wire);
+        assert!(
+            matches.lower_tier[&StorageTier::HostPinned]
+                .cross_worker_spans
+                .is_empty(),
+            "materialization spans are deliberately local-only"
+        );
+
+        let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+
+        assert!(matches!(
+            decision,
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn materialize_empty_chain_fails_closed() {
+        let hashes = block_hashes(5);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let matches = tiered_matches(&[(target, 2)], &[(source, 5)]);
+        let selected = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+
+        let decision = materialize_remote_g2_reuse_plan(selected, &hashes, |_, _, _| Vec::new());
+
+        assert!(matches!(
+            decision,
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn materialize_racing_short_chain_shrinks_plan_consistently() {
+        let hashes = block_hashes(5);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let matches = tiered_matches(&[(target, 2)], &[(source, 5)]);
+        let selected = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+
+        let decision = materialize_remote_g2_reuse_plan(selected, &hashes, |_, _, requested| {
+            assert_eq!(requested, hashes.as_slice());
+            vec![
+                ExternalSequenceBlockHash(100),
+                ExternalSequenceBlockHash(101),
+                ExternalSequenceBlockHash(102),
+                ExternalSequenceBlockHash(103),
+            ]
+        });
+
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.planned_prefix_blocks, 2);
+                assert_eq!(plan.block_hashes, hashes[2..4]);
+                assert_eq!(plan.kv_block_hashes, vec![102, 103]);
+            }
+            other => panic!("expected a shortened materialized plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_inconsistent_plan_window_fails_before_resolver() {
+        let hashes = block_hashes(5);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let matches = tiered_matches(&[(target, 2)], &[(source, 5)]);
+        let mut selected = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+        let RemoteKvReuseDecision::Plan { plan, .. } = &mut selected else {
+            panic!("fixture must select a plan");
+        };
+        plan.block_hashes[0] = LocalBlockHash(u64::MAX);
+
+        let decision = materialize_remote_g2_reuse_plan(selected, &hashes, |_, _, _| {
+            panic!("resolver must not run for an inconsistent plan")
+        });
+
+        assert!(matches!(
+            decision,
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -654,12 +916,13 @@ mod tests {
     #[test]
     fn scenario_g1_partial_g2_tail_start_at_device_match() {
         // Source A has 2 device-tier matches and 2 HostPinned hits chained
-        // past them → plan covers request positions [2, 4) and
-        // start_block_index == 2 (skip past A's device chain).
+        // past them. The target also has the first 2 blocks locally, so the
+        // source span is contiguous with the target's next missing block and
+        // the plan covers request positions [2, 4).
         let hashes = block_hashes(6);
         let target = WorkerWithDpRank::new(9, 0);
         let source = WorkerWithDpRank::new(7, 0);
-        let matches = tiered_matches(&[(source, 2)], &[(source, 2)]);
+        let matches = tiered_matches(&[(source, 2), (target, 2)], &[(source, 2)]);
 
         let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
 
@@ -753,7 +1016,7 @@ mod tests {
         let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
 
         match decision {
-            RemoteKvReuseDecision::Plan { plan, stats } => {
+            RemoteKvReuseDecision::Plan { plan, stats, .. } => {
                 assert_eq!(plan.source_worker_id, 7);
                 assert_eq!(plan.start_block_index, 0);
                 assert_eq!(plan.planned_prefix_blocks, hashes.len() as u32);
@@ -777,7 +1040,7 @@ mod tests {
         let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
 
         match decision {
-            RemoteKvReuseDecision::Plan { plan, stats } => {
+            RemoteKvReuseDecision::Plan { plan, stats, .. } => {
                 assert_eq!(plan.source_worker_id, 7);
                 assert_eq!(plan.start_block_index, 0);
                 assert_eq!(plan.planned_prefix_blocks, 3);

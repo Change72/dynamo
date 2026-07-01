@@ -20,10 +20,29 @@ use std::sync::{Arc, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::indexer::{
-    CrossWorkerAnchor, KvIndexerMetrics, LowerTierContinuation, LowerTierIndexer,
+    CrossWorkerSpan, KvIndexerMetrics, LowerTierContinuation, LowerTierIndexer,
     LowerTierMatchDetails, MatchDetails, ThreadPoolIndexer, WireTieredMatchDetails,
 };
-use crate::protocols::{LocalBlockHash, StorageTier};
+use crate::protocols::{LocalBlockHash, StorageTier, WorkerWithDpRank};
+
+fn insert_cross_worker_span(
+    spans: &mut FxHashMap<WorkerWithDpRank, Vec<CrossWorkerSpan>>,
+    worker: WorkerWithDpRank,
+    candidate: CrossWorkerSpan,
+) {
+    if candidate.end_pos <= candidate.start_pos {
+        return;
+    }
+
+    let worker_spans = spans.entry(worker).or_default();
+    if let Some(existing) = worker_spans.iter_mut().find(|span| {
+        span.start_pos == candidate.start_pos && span.parent_hash == candidate.parent_hash
+    }) {
+        existing.end_pos = existing.end_pos.max(candidate.end_pos);
+    } else {
+        worker_spans.push(candidate);
+    }
+}
 
 /// Holds one per-tier [`ThreadPoolIndexer<LowerTierIndexer>`] for every
 /// non-device [`StorageTier`] that has received at least one event.
@@ -258,49 +277,60 @@ pub fn query_lower_tiers(
         //     host-pinned blocks already covered by its own device chain are
         //     suppressed. Consumed by cache-hit estimation; pins the
         //     `does_not_double_count` invariant.
-        //   * `cross_worker_hits` = Path A merged with Path B (fresh-from-root
-        //     per worker), max per worker. The non-dedup'd view consumed ONLY
-        //     by `select_remote_g2_reuse_plan`: a remote target must see a peer
-        //     host-pinned block even when that peer still holds the prefix on
-        //     its own GPU.
-        // Alongside the max-merged hit count, record the ANCHOR of whichever
-        // chain we counted so the materializer can walk the SAME chain instead
-        // of reverse-inferring its start from the (Path-A) `next_continuations`
-        // and the (Path-B) hit count — which disagree whenever the two paths
-        // start at different positions. Path A extends from the worker's device
-        // tail at `extension_continuations[worker].start_pos`; Path B starts
-        // fresh from root (pos 0). Tie -> Path B (the natural cross-worker view).
+        //   * `cross_worker_hits` = maximum raw span length across Path A and
+        //     Path B, retained as a summary for metrics/wire compatibility.
+        //   * `cross_worker_spans` = BOTH materializable candidates, including
+        //     their exact start/end and parent anchor. Plan selection cannot
+        //     pick a winner here: which span is useful depends on the eventual
+        //     target's local prefix. For example, root [0, 2) is useless to a
+        //     target that already has 3 blocks, while extension [3, 5) is not.
         let mut cross_worker_hits = extension_matches.hits.clone();
-        let mut cross_worker_anchors: FxHashMap<_, CrossWorkerAnchor> = FxHashMap::default();
-        for (worker, _) in &extension_matches.hits {
-            let seed = extension_continuations.get(worker);
-            cross_worker_anchors.insert(
+        let mut cross_worker_spans: FxHashMap<_, Vec<CrossWorkerSpan>> = FxHashMap::default();
+        for (worker, &hits) in &extension_matches.hits {
+            let Some(seed) = extension_continuations.get(worker) else {
+                debug_assert!(false, "lower-tier hit missing its query continuation");
+                continue;
+            };
+            let start_pos = seed.start_pos;
+            insert_cross_worker_span(
+                &mut cross_worker_spans,
                 *worker,
-                CrossWorkerAnchor {
-                    start_pos: seed.map(|c| c.start_pos).unwrap_or(0),
-                    parent_hash: seed.and_then(|c| c.last_matched_hash),
+                CrossWorkerSpan {
+                    start_pos,
+                    end_pos: start_pos.saturating_add(hits),
+                    parent_hash: seed.last_matched_hash,
                 },
             );
         }
         for (worker, &fresh_hits) in &fresh_matches.hits {
             let cw = cross_worker_hits.get(worker).copied().unwrap_or(0);
-            // `>=` so a tie prefers Path B's from-root anchor (start_pos 0).
-            if fresh_hits >= cw {
+            if fresh_hits > cw {
                 cross_worker_hits.insert(*worker, fresh_hits);
-                cross_worker_anchors.insert(
-                    *worker,
-                    CrossWorkerAnchor {
-                        start_pos: 0,
-                        parent_hash: None,
-                    },
-                );
             }
+            insert_cross_worker_span(
+                &mut cross_worker_spans,
+                *worker,
+                CrossWorkerSpan {
+                    start_pos: 0,
+                    end_pos: fresh_hits,
+                    parent_hash: None,
+                },
+            );
+        }
+        for spans in cross_worker_spans.values_mut() {
+            spans.sort_unstable_by_key(|span| {
+                (
+                    span.start_pos,
+                    span.end_pos,
+                    span.parent_hash.map(|hash| hash.0),
+                )
+            });
         }
 
         let result = LowerTierMatchDetails {
             hits: extension_matches.hits,
             cross_worker_hits,
-            cross_worker_anchors,
+            cross_worker_spans,
             next_continuations: extension_matches.next_continuations,
         };
 
@@ -328,10 +358,14 @@ pub fn query_lower_tiers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::KvIndexerInterface;
+    use crate::indexer::{KvIndexerInterface, TieredMatchDetails};
     use crate::protocols::{
         ExternalSequenceBlockHash, KvCacheEventData, KvCacheStoreData, LocalBlockHash,
         OverlapScores, RouterEvent, WorkerWithDpRank,
+    };
+    use crate::remote_g2_plan::{
+        RemoteKvReuseDecision, RemoteKvReuseSelectionInput, materialize_remote_g2_reuse_plan,
+        select_remote_g2_reuse_plan,
     };
     use crate::test_utils::{router_event, stored_blocks_with_sequence_hashes};
 
@@ -368,32 +402,6 @@ mod tests {
         d
     }
 
-    /// Materialize the plan window [start, end) exactly as `kv_router.rs` does:
-    /// walk the source's host-pinned chain from its recorded anchor, then drop
-    /// the [anchor.start_pos, start) prefix the target already holds.
-    fn materialize_window(
-        indexers: &LowerTierIndexers,
-        details: &LowerTierMatchDetails,
-        source: WorkerWithDpRank,
-        sequence: &[LocalBlockHash],
-        start: usize,
-        end: usize,
-    ) -> Vec<u64> {
-        let anchor = details.cross_worker_anchors.get(&source).copied();
-        let hp_start = anchor.map(|a| a.start_pos).unwrap_or(start).min(start);
-        let parent = anchor.and_then(|a| a.parent_hash);
-        let hp = indexers.get(StorageTier::HostPinned).unwrap();
-        let full =
-            hp.backend()
-                .chain_block_hashes_for_worker(source, parent, &sequence[hp_start..end]);
-        let skip = start - hp_start;
-        if full.len() > skip {
-            full[skip..].iter().map(|h| h.0).collect()
-        } else {
-            Vec::new()
-        }
-    }
-
     #[test]
     fn query_lower_tiers_returns_empty_when_no_tiers_allocated() {
         let indexers = LowerTierIndexers::new(1, 4);
@@ -418,16 +426,23 @@ mod tests {
     // Regression 1 (the observed 4×TP1 gated-microbenchmark failure): a source
     // that holds the FULL host-pinned chain from root AND the full device
     // prefix, with a target that already has the first 2 blocks locally. The
-    // materializer must return the REMAINING external hashes for the window
-    // [2, 5), walking from the source's real chain start (root) and skipping 2
-    // — not anchoring at position 2 on the source's device tail (which misses).
+    // query must preserve the root span [0, 5), so the later target-aware
+    // materializer can walk from root and skip the target's first 2 blocks —
+    // not anchor at position 2 on the source's device tail (which misses).
     #[tokio::test]
     async fn cross_worker_chain_from_root_skips_target_local_prefix() {
         let src = WorkerWithDpRank::new(1, 0);
+        let target = WorkerWithDpRank::new(2, 0);
         let indexers = LowerTierIndexers::new(1, 1);
         let hp = indexers.get_or_create(StorageTier::HostPinned);
-        hp.apply_event(hp_store(1, 0, None, &[10, 11, 12, 13, 14], &[100, 101, 102, 103, 104]))
-            .await;
+        hp.apply_event(hp_store(
+            1,
+            0,
+            None,
+            &[10, 11, 12, 13, 14],
+            &[100, 101, 102, 103, 104],
+        ))
+        .await;
         let _ = hp.dump_events().await; // flush the worker thread
 
         let sequence: Vec<LocalBlockHash> = [10, 11, 12, 13, 14]
@@ -435,21 +450,24 @@ mod tests {
             .map(LocalBlockHash)
             .collect();
         // Source matched the whole prefix on device too (tail external 104).
-        let device = device_match(src, 5, Some(104));
+        let mut device = device_match(src, 5, Some(104));
+        device.overlap_scores.scores.insert(target, 2);
+        device
+            .last_matched_hashes
+            .insert(target, ExternalSequenceBlockHash(201));
         let result = query_lower_tiers(&indexers, &sequence, &device);
         let details = &result[&StorageTier::HostPinned];
 
-        // The recorded anchor is the from-root chain start, NOT the device tail.
-        let anchor = details.cross_worker_anchors[&src];
-        assert_eq!(anchor.start_pos, 0);
-        assert_eq!(anchor.parent_hash, None);
-        assert_eq!(details.cross_worker_hits[&src], 5);
-
-        // Window [2, 5) => the remaining external hashes.
+        // The recorded span is the from-root chain, NOT the device tail.
         assert_eq!(
-            materialize_window(&indexers, details, src, &sequence, 2, 5),
-            vec![102, 103, 104],
+            details.cross_worker_spans[&src],
+            vec![CrossWorkerSpan {
+                start_pos: 0,
+                end_pos: 5,
+                parent_hash: None,
+            }]
         );
+        assert_eq!(details.cross_worker_hits[&src], 5);
 
         // Guard: the OLD buggy anchor (device tail 104 at position 2) misses,
         // which is exactly why every p2..p8 pull silently recomputed.
@@ -459,14 +477,45 @@ mod tests {
             &sequence[2..5],
         );
         assert!(wrong.is_empty(), "device-tail anchor at start>0 must miss");
+
+        let tiered = TieredMatchDetails {
+            device,
+            lower_tier: result,
+        };
+        let decision = select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+            request_id: "root-span",
+            target,
+            block_hashes: &sequence,
+            block_size_tokens: 1,
+            tiered_matches: &tiered,
+            created_at_ms: 1,
+            expires_at_ms: 2,
+        });
+        let decision = materialize_remote_g2_reuse_plan(
+            decision,
+            &sequence,
+            |source, parent_hash, token_hashes| {
+                hp.backend()
+                    .chain_block_hashes_for_worker(source, parent_hash, token_hashes)
+            },
+        );
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.start_block_index, 2);
+                assert_eq!(plan.block_hashes, sequence[2..5]);
+                assert_eq!(plan.kv_block_hashes, vec![102, 103, 104]);
+            }
+            other => panic!("expected materialized root-span plan, got {other:?}"),
+        }
     }
 
     // Regression 2: a source whose host-pinned chain is NOT walkable from root
     // — it extends from the source's device tail (parent 101 at position 2).
-    // The materializer must anchor on that device tail at start_pos 2.
+    // The query must preserve that exact device-tail span for materialization.
     #[tokio::test]
     async fn cross_worker_chain_non_root_extends_from_device_tail() {
         let src = WorkerWithDpRank::new(1, 0);
+        let target = WorkerWithDpRank::new(2, 0);
         let indexers = LowerTierIndexers::new(1, 1);
         let hp = indexers.get_or_create(StorageTier::HostPinned);
         // Host-pinned blocks 2..5 hang off device tail external 101.
@@ -478,18 +527,128 @@ mod tests {
             .into_iter()
             .map(LocalBlockHash)
             .collect();
-        let device = device_match(src, 2, Some(101));
+        let mut device = device_match(src, 2, Some(101));
+        device.overlap_scores.scores.insert(target, 2);
+        device
+            .last_matched_hashes
+            .insert(target, ExternalSequenceBlockHash(201));
         let result = query_lower_tiers(&indexers, &sequence, &device);
         let details = &result[&StorageTier::HostPinned];
 
-        let anchor = details.cross_worker_anchors[&src];
-        assert_eq!(anchor.start_pos, 2, "chain extends from device tail at pos 2");
-        assert_eq!(anchor.parent_hash, Some(ExternalSequenceBlockHash(101)));
+        assert_eq!(
+            details.cross_worker_spans[&src],
+            vec![CrossWorkerSpan {
+                start_pos: 2,
+                end_pos: 5,
+                parent_hash: Some(ExternalSequenceBlockHash(101)),
+            }],
+            "chain extends from device tail at pos 2"
+        );
         assert_eq!(details.cross_worker_hits[&src], 3);
 
-        assert_eq!(
-            materialize_window(&indexers, details, src, &sequence, 2, 5),
-            vec![102, 103, 104],
+        let tiered = TieredMatchDetails {
+            device,
+            lower_tier: result,
+        };
+        let decision = select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+            request_id: "non-root-span",
+            target,
+            block_hashes: &sequence,
+            block_size_tokens: 1,
+            tiered_matches: &tiered,
+            created_at_ms: 1,
+            expires_at_ms: 2,
+        });
+        let decision = materialize_remote_g2_reuse_plan(
+            decision,
+            &sequence,
+            |source, parent_hash, token_hashes| {
+                hp.backend()
+                    .chain_block_hashes_for_worker(source, parent_hash, token_hashes)
+            },
         );
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.start_block_index, 2);
+                assert_eq!(plan.block_hashes, sequence[2..5]);
+                assert_eq!(plan.kv_block_hashes, vec![102, 103, 104]);
+            }
+            other => panic!("expected materialized non-root plan, got {other:?}"),
+        }
+    }
+
+    /// Path A and Path B may expose different chains for the same source. The
+    /// query must retain both until the target is known; choosing by raw hits
+    /// here would discard the only span contiguous with target prefix 3.
+    #[tokio::test]
+    async fn query_select_materialize_keeps_both_source_paths() {
+        let src = WorkerWithDpRank::new(1, 0);
+        let target = WorkerWithDpRank::new(2, 0);
+        let indexers = LowerTierIndexers::new(1, 1);
+        let hp = indexers.get_or_create(StorageTier::HostPinned);
+
+        // Path B: a root chain covering only [0, 2).
+        hp.apply_event(hp_store(1, 0, None, &[10, 11], &[100, 101]))
+            .await;
+        // Path A: a separate chain extending the source's device tail at 3.
+        hp.apply_event(hp_store(1, 1, Some(201), &[13, 14], &[203, 204]))
+            .await;
+        let _ = hp.dump_events().await;
+
+        let sequence: Vec<LocalBlockHash> = [10, 11, 12, 13, 14]
+            .into_iter()
+            .map(LocalBlockHash)
+            .collect();
+        let mut device = device_match(src, 3, Some(201));
+        device.overlap_scores.scores.insert(target, 3);
+        device
+            .last_matched_hashes
+            .insert(target, ExternalSequenceBlockHash(301));
+        let result = query_lower_tiers(&indexers, &sequence, &device);
+        assert_eq!(
+            result[&StorageTier::HostPinned].cross_worker_spans[&src],
+            vec![
+                CrossWorkerSpan {
+                    start_pos: 0,
+                    end_pos: 2,
+                    parent_hash: None,
+                },
+                CrossWorkerSpan {
+                    start_pos: 3,
+                    end_pos: 5,
+                    parent_hash: Some(ExternalSequenceBlockHash(201)),
+                },
+            ]
+        );
+
+        let tiered = TieredMatchDetails {
+            device,
+            lower_tier: result,
+        };
+        let decision = select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+            request_id: "both-paths",
+            target,
+            block_hashes: &sequence,
+            block_size_tokens: 1,
+            tiered_matches: &tiered,
+            created_at_ms: 1,
+            expires_at_ms: 2,
+        });
+        let decision = materialize_remote_g2_reuse_plan(
+            decision,
+            &sequence,
+            |source, parent_hash, token_hashes| {
+                hp.backend()
+                    .chain_block_hashes_for_worker(source, parent_hash, token_hashes)
+            },
+        );
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.start_block_index, 3);
+                assert_eq!(plan.block_hashes, sequence[3..5]);
+                assert_eq!(plan.kv_block_hashes, vec![203, 204]);
+            }
+            other => panic!("expected extension-path plan, got {other:?}"),
+        }
     }
 }

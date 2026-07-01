@@ -162,17 +162,26 @@ impl LowerTierContinuation {
     }
 }
 
-/// Anchor for the chain counted in [`LowerTierMatchDetails::cross_worker_hits`]:
-/// where that worker's counted host-pinned chain begins and the external hash
-/// that seeds it. The remote-G2 materializer walks the SAME chain the planner
-/// counted by seeding `chain_block_hashes_for_worker` from `parent_hash` at
-/// `start_pos` — instead of reverse-inferring the start from mixed Path-A
-/// (`next_continuations`) and Path-B (`cross_worker_hits`) views, which is
-/// wrong whenever the two paths disagree on the chain's start position.
+/// One locally materializable cross-worker lower-tier chain.
+///
+/// `start_pos..end_pos` is the half-open range of request blocks owned by the
+/// worker on this chain. `parent_hash` is the external hash immediately before
+/// `start_pos` (or `None` for a root chain). A worker can have more than one
+/// candidate for the same request: for example, a root chain discovered by the
+/// fresh query and a non-root extension discovered from its device-tier tail.
+/// The target-aware remote-G2 selector chooses between those candidates only
+/// after the target's local prefix length is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CrossWorkerAnchor {
+pub struct CrossWorkerSpan {
     pub start_pos: usize,
+    pub end_pos: usize,
     pub parent_hash: Option<ExternalSequenceBlockHash>,
+}
+
+impl CrossWorkerSpan {
+    pub fn hits(self) -> usize {
+        self.end_pos.saturating_sub(self.start_pos)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,15 +190,17 @@ pub struct LowerTierMatchDetails {
     /// BEYOND its own device-tier coverage. Consumed by cache-hit estimation
     /// and pinned by the `does_not_double_count` invariant.
     pub hits: FxHashMap<WorkerWithDpRank, usize>,
-    /// Cross-worker (remote-G2) view: per-worker host-pinned hits counted from
-    /// root, NOT suppressed by the worker's own device coverage. Consumed ONLY
-    /// by `select_remote_g2_reuse_plan`, which must see a peer host-pinned
-    /// block even when that peer also still holds it on its GPU.
+    /// Cross-worker (remote-G2) summary: the largest raw span length observed
+    /// for each worker across the extension and fresh-from-root queries. Kept
+    /// for metrics and wire compatibility; plan selection must use
+    /// `cross_worker_spans`, because a raw length alone does not say whether a
+    /// span is contiguous with the chosen target's local prefix.
     pub cross_worker_hits: FxHashMap<WorkerWithDpRank, usize>,
-    /// Per-worker anchor {start_pos, parent_hash} for the chain counted in
-    /// `cross_worker_hits`. Local-only (like `next_continuations`); not carried
-    /// on the wire. Lets the materializer walk the exact chain that was counted.
-    pub cross_worker_anchors: FxHashMap<WorkerWithDpRank, CrossWorkerAnchor>,
+    /// Every locally discovered materializable span for each worker. This is
+    /// local-only (like `next_continuations`) and intentionally not carried on
+    /// the wire: a remote indexer cannot currently materialize external block
+    /// hashes, so wire-inbound matches fail closed instead of guessing.
+    pub cross_worker_spans: FxHashMap<WorkerWithDpRank, Vec<CrossWorkerSpan>>,
     pub next_continuations: FxHashMap<WorkerWithDpRank, LowerTierContinuation>,
 }
 

@@ -21,7 +21,7 @@ use dynamo_kv_router::{
     },
     remote_g2_plan::{
         RemoteKvReuseDecision, RemoteKvReuseNoPlanReason, RemoteKvReuseSelectionInput,
-        RemoteKvReuseSelectionStats, select_remote_g2_reuse_plan,
+        RemoteKvReuseSelectionStats, materialize_remote_g2_reuse_plan, select_remote_g2_reuse_plan,
     },
     scheduling::{
         CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, ScheduleMode,
@@ -627,32 +627,33 @@ where
         // worker as the target and the retained tiered matches to find a remote
         // host-pinned source. Always produces a decision (NoPlan when disabled).
         let created_at_ms = unix_epoch_ms();
-        let mut remote_kv_reuse = if remote_g2_reuse_enabled() {
-            select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
-                request_id: context_id.unwrap_or_default(),
-                target: response.best_worker,
-                block_hashes: &g2_block_hashes,
-                block_size_tokens: self.block_size,
-                tiered_matches: &tiered_matches,
-                created_at_ms,
-                expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
-            })
-        } else {
-            RemoteKvReuseDecision::NoPlan {
-                reason: RemoteKvReuseNoPlanReason::Disabled,
-                stats: RemoteKvReuseSelectionStats::default(),
-            }
-        };
+        let mut remote_kv_reuse =
+            if remote_g2_reuse_enabled() && self.indexer.supports_remote_g2_materialization() {
+                select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+                    request_id: context_id.unwrap_or_default(),
+                    target: response.best_worker,
+                    block_hashes: &g2_block_hashes,
+                    block_size_tokens: self.block_size,
+                    tiered_matches: &tiered_matches,
+                    created_at_ms,
+                    expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
+                })
+            } else {
+                RemoteKvReuseDecision::NoPlan {
+                    reason: RemoteKvReuseNoPlanReason::Disabled,
+                    stats: RemoteKvReuseSelectionStats::default(),
+                }
+            };
 
-        // Post-selection: extract the chosen source's host-pinned chain of
-        // TRT-LLM-side block_hashes and populate the plan. The chain may
-        // come back shorter than `planned_prefix_blocks` if eviction races
-        // with our walk; in that case shrink the plan to the chain length,
-        // or demote to NoPlan if the chain is empty entirely.
+        // KVCC resolves the source from the Router-advertised per-DP control
+        // endpoint. Preserve Moein's endpoint contract while using the exact
+        // target-relative span selected above. A plan without a live endpoint
+        // must fail closed before attempting local chain materialization.
         let mut missing_control_endpoint_stats = None;
         if let RemoteKvReuseDecision::Plan {
             plan,
             stats: plan_stats,
+            ..
         } = &mut remote_kv_reuse
         {
             let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
@@ -672,77 +673,28 @@ where
             };
         }
 
-        if let RemoteKvReuseDecision::Plan {
-            plan,
-            stats: plan_stats,
-        } = &mut remote_kv_reuse
-        {
-            let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
-                plan.source_worker_id,
-                plan.source_dp_rank,
-            );
-            let chain_start = plan.start_block_index as usize;
-            let chain_end = chain_start + plan.planned_prefix_blocks as usize;
-            // Walk the source's host-pinned chain from where it ACTUALLY begins
-            // (its recorded cross-worker anchor {start_pos, parent}), then drop
-            // the leading blocks the target already covers locally. Anchoring
-            // directly at chain_start with the source's DEVICE tail is wrong
-            // whenever chain_start > source_hp_start: the parent of block
-            // chain_start is then an INTERIOR host-pinned hash, not the device
-            // tail, so the walk from (device_tail, token[chain_start]) misses
-            // and the whole chain comes back empty (NoContiguousPrefix).
-            let anchor = tiered_matches
-                .lower_tier
-                .get(&dynamo_kv_router::protocols::StorageTier::HostPinned)
-                .and_then(|m| m.cross_worker_anchors.get(&source))
-                .copied();
-            let hp_start = anchor
-                .map(|a| a.start_pos)
-                .unwrap_or(chain_start)
-                .min(chain_start);
-            let parent_hash = anchor.and_then(|a| a.parent_hash);
+        // Post-selection materialization uses the exact span selected above;
+        // it never re-derives an anchor from a different Path-A/Path-B view.
+        // Missing/inconsistent local state fails closed, while an eviction race
+        // may only shrink the plan to a non-empty materialized prefix.
+        remote_kv_reuse = materialize_remote_g2_reuse_plan(
+            remote_kv_reuse,
+            &g2_block_hashes,
+            |source, parent_hash, token_hashes| {
+                self.indexer
+                    .chain_block_hashes_for_host_pinned(source, parent_hash, token_hashes)
+            },
+        );
 
-            let full_chain = self.indexer.chain_block_hashes_for_host_pinned(
-                source,
-                parent_hash,
-                &g2_block_hashes[hp_start..chain_end],
-            );
-            // Drop [hp_start, chain_start): the prefix the target already holds.
-            // If the source's walk didn't even reach chain_start, the plan
-            // window is empty and demotes to NoContiguousPrefix below.
-            let skip = chain_start - hp_start;
-            let chain: Vec<_> = if full_chain.len() > skip {
-                full_chain[skip..].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            // PROBE: emit at WARN so worker-side block_hash logs can be
-            // cross-referenced against planner output. Investigation-only
-            // until the hash plumbing is validated end-to-end.
-            tracing::warn!(
+        if let RemoteKvReuseDecision::Plan { plan, .. } = &remote_kv_reuse {
+            tracing::debug!(
                 plan_id = %plan.plan_id,
-                source_worker_id = source.worker_id,
-                source_dp_rank = source.dp_rank,
+                source_worker_id = plan.source_worker_id,
+                source_dp_rank = plan.source_dp_rank,
                 requested_block_hashes = ?plan.block_hashes,
-                chain_kv_block_hashes = ?chain,
-                "PROBE remote_g2_plan kv_block_hash chain"
+                chain_kv_block_hashes = ?plan.kv_block_hashes,
+                "Materialized remote-G2 block-hash chain"
             );
-
-            if chain.is_empty() {
-                let stats_copy = *plan_stats;
-                remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
-                    reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
-                    stats: stats_copy,
-                };
-            } else {
-                if chain.len() < chain_end - chain_start {
-                    let new_len = chain.len();
-                    plan.planned_prefix_blocks = new_len as u32;
-                    plan.block_hashes.truncate(new_len);
-                }
-                plan.kv_block_hashes = chain.into_iter().map(|h| h.0).collect();
-            }
         }
 
         let total_elapsed = start.elapsed();
