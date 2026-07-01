@@ -413,6 +413,39 @@ def _uses_remote_g2_offloading(engine_config: AsyncEngineArgs) -> bool:
     return False
 
 
+def remote_g2_extra_configs(engine_config: AsyncEngineArgs) -> list[dict]:
+    """Return the mutable ``kv_connector_extra_config`` dict(s) that select the
+    RemoteG2 spec — the direct connector and/or any nested inside PdConnector.
+
+    Mutating an entry in place (before the EngineCore subprocess is spawned)
+    lets the caller canonicalize dynamic-mode fields (source_worker_id,
+    source_rpc_socket_path, target_bridge_socket_path, use_dynamo_bridge)
+    without reassigning the (possibly frozen) config object."""
+    kv_cfg = getattr(engine_config, "kv_transfer_config", None)
+    if kv_cfg is None:
+        return []
+    out: list[dict] = []
+    direct = kv_cfg.kv_connector_extra_config
+    if (
+        kv_cfg.kv_connector == "OffloadingConnector"
+        and isinstance(direct, dict)
+        and direct.get("spec_name") == "RemoteG2OffloadingSpec"
+    ):
+        out.append(direct)
+    if kv_cfg.kv_connector == "PdConnector" and isinstance(direct, dict):
+        for entry in direct.get("connectors", []):
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("kv_connector_extra_config")
+            if (
+                entry.get("kv_connector") == "OffloadingConnector"
+                and isinstance(nested, dict)
+                and nested.get("spec_name") == "RemoteG2OffloadingSpec"
+            ):
+                out.append(nested)
+    return out
+
+
 def _uses_dynamo_connector(engine_config: AsyncEngineArgs) -> bool:
     """Check if the user-provided --kv-transfer-config uses DynamoConnector (KVBM).
 

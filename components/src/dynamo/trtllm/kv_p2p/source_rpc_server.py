@@ -26,6 +26,7 @@ two in-flight requests on one socket). For POC throughput this is fine
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import pickle
@@ -46,14 +47,22 @@ class _ZmqReqWrapper:
     def __init__(self, socket_path: str, timeout_ms: int = 5000) -> None:
         import zmq
 
+        self._zmq = zmq
         self._socket_path = socket_path
         self._ctx = zmq.Context.instance()
-        self._socket = self._ctx.socket(zmq.REQ)
-        self._socket.RCVTIMEO = timeout_ms
-        self._socket.SNDTIMEO = timeout_ms
-        # `connect()` is lazy — actual connection happens on first send.
-        self._socket.connect(f"ipc://{socket_path}")
+        self._timeout_ms = timeout_ms
+        self._socket: Optional[Any] = None
         self._lock = threading.Lock()
+        self._connect_locked()
+
+    def _connect_locked(self) -> None:
+        sock = self._ctx.socket(self._zmq.REQ)
+        sock.RCVTIMEO = self._timeout_ms
+        sock.SNDTIMEO = self._timeout_ms
+        sock.LINGER = 0
+        # `connect()` is lazy — actual connection happens on first send.
+        sock.connect(f"ipc://{self._socket_path}")
+        self._socket = sock
 
     def request(self, method: str, payload: dict) -> dict:
         """Synchronously round-trip a single RPC. Returns the response dict.
@@ -62,10 +71,23 @@ class _ZmqReqWrapper:
         the engine subprocess expects: pickle-encoded
         ``{"method": ..., "payload": ...}`` request, pickle-encoded
         ``{"ok": bool, "result"|"error": ...}`` response.
+
+        On a ZMQ error (notably a recv timeout, ``zmq.error.Again``) the REQ
+        socket is left in the wrong send/recv state (EFSM) and every later call
+        would fail; drop and recreate it before re-raising so the next request
+        starts clean.
         """
         with self._lock:
-            self._socket.send(pickle.dumps({"method": method, "payload": payload}))
-            raw = self._socket.recv()
+            sock = self._socket
+            assert sock is not None  # set by _connect_locked() in __init__
+            try:
+                sock.send(pickle.dumps({"method": method, "payload": payload}))
+                raw = sock.recv()
+            except self._zmq.error.ZMQError:
+                with contextlib.suppress(Exception):
+                    sock.close(linger=0)
+                self._connect_locked()
+                raise
         return pickle.loads(raw)
 
 
@@ -141,6 +163,16 @@ def _make_metadata_handler(req_wrapper: _ZmqReqWrapper):
             payload["peer_name"] = peer_name
         if peer_conn:
             payload["peer_connection_info"] = peer_conn
+        # vLLM Remote-G2 uses a metadata-bytes + per-rank handshake
+        # (peer_metadata_b64 -> add_remote_agent, tp_rank -> per-rank bundle)
+        # instead of TRT-LLM's connection-info handshake. Forward those fields
+        # too so the same source endpoint serves both engines.
+        peer_metadata_b64 = req.get("peer_metadata_b64")
+        tp_rank = req.get("tp_rank")
+        if peer_metadata_b64:
+            payload["peer_metadata_b64"] = peer_metadata_b64
+        if tp_rank is not None:
+            payload["tp_rank"] = tp_rank
         loop = asyncio.get_running_loop()
         try:
             response = await loop.run_in_executor(
@@ -176,14 +208,27 @@ def _wait_for_socket(path: str, timeout_s: float = 30.0) -> bool:
     return False
 
 
+class SourceRpcHandle:
+    """Keeps the source RPC alive and exposes the serve tasks for supervision.
+
+    The three ``serve_endpoint`` tasks are long-lived; returning them lets the
+    worker fold them into its serving ``asyncio.gather`` so a registration or
+    runtime failure terminates dynamic-mode serving (fail-closed) instead of
+    being swallowed as an unretrieved task exception."""
+
+    def __init__(self, req_wrapper: "_ZmqReqWrapper", tasks: list) -> None:
+        self.req_wrapper = req_wrapper
+        self.tasks = tasks
+
+
 async def setup_source_rpc_endpoints(
     runtime: Any,
     namespace: str,
     component: str,
-) -> Optional[_ZmqReqWrapper]:
-    """Register the two source-side dynamo runtime endpoints and spawn
-    their serving tasks. Returns the ``_ZmqReqWrapper`` so the caller
-    can hold it alive (the socket closes when the wrapper is GCed).
+) -> Optional[SourceRpcHandle]:
+    """Register the three source-side dynamo runtime endpoints and spawn their
+    serving tasks. Returns a ``SourceRpcHandle`` (holding the req wrapper alive
+    and carrying the serve tasks for supervision).
 
     Returns ``None`` if the engine subprocess's ZMQ REP socket never
     appears (e.g. remote-G2 wasn't actually bootstrapped).
@@ -227,4 +272,4 @@ async def setup_source_rpc_endpoints(
         component,
         socket_path,
     )
-    return req_wrapper
+    return SourceRpcHandle(req_wrapper, [_resolve_task, _release_task, _metadata_task])

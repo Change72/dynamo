@@ -823,18 +823,17 @@ def build_sampling_params(
     # remote_kv_reuse_plan from request.extra_args and translate it into
     # vLLM's kv_transfer_params["remote_g2_plan"] shape.
     #
-    # Identity translation: the Rust Router carries source/target as
-    # Dynamo's WorkerId (lease/instance id, ~64-bit), but vLLM's source
-    # RPC and the locally-configured peer_endpoints map are keyed by the
-    # integer worker_id we set via REMOTE_G2_SOURCE_WORKER_ID. Without
-    # rewriting source_worker_id / target_worker_id on the way in, the
-    # vLLM-side target client lookup fails with "no peer endpoint
-    # registered for worker_id=<dynamo-id>". For the 2-worker
-    # verification path we infer the local integer worker_id from the
-    # REMOTE_G2_SOURCE_WORKER_ID env and use it for `target`; the source
-    # is the only other peer in a 2-worker setup. The right long-term
-    # fix is a shared dynamic discovery layer (see kv-p2p framework
-    # differences doc, Difference 2).
+    # The Rust Router carries source/target as Dynamo's WorkerId
+    # (lease/instance id, ~64-bit). Two transports consume it:
+    #  * Dynamic (REMOTE_G2_USE_DYNAMO_BRIDGE): the vLLM target reaches the
+    #    source through the dynamo parent target-bridge via
+    #    client.direct(source_worker_id), so the real WorkerId is exactly
+    #    what it needs — pass source/target through UNCHANGED. This is the
+    #    cross-node / >2-worker path.
+    #  * Static (default): vLLM's peer_endpoints map is keyed by the small
+    #    integer worker id set via REMOTE_G2_SOURCE_WORKER_ID, not the 64-bit
+    #    WorkerId, so we must rewrite target->self and source->the-other-of
+    #    {1,2}. This preserves the same-host 2-worker smoke path.
     try:
         _ea = request.get("extra_args")
         _router_plan = (
@@ -844,24 +843,30 @@ def build_sampling_params(
             import logging as _logging
             import os as _os
 
-            _self_wid_str = _os.environ.get("REMOTE_G2_SOURCE_WORKER_ID")
-            if _self_wid_str is not None:
-                try:
-                    _self_wid = int(_self_wid_str)
-                    # 2-worker verification: the only peer is whichever
-                    # of {1, 2} is not me.
-                    _peer_wid = 2 if _self_wid == 1 else 1
-                    _router_plan = dict(_router_plan)
-                    _router_plan["target_worker_id"] = _self_wid
-                    _router_plan["source_worker_id"] = _peer_wid
-                except ValueError:
-                    pass
+            _use_bridge = _os.environ.get(
+                "REMOTE_G2_USE_DYNAMO_BRIDGE", ""
+            ).strip().lower() in ("1", "true", "yes")
+            if not _use_bridge:
+                # Static 2-worker path: the only peer is whichever of {1, 2}
+                # is not me. (Dynamic path leaves the router's WorkerIds as-is.)
+                _self_wid_str = _os.environ.get("REMOTE_G2_SOURCE_WORKER_ID")
+                if _self_wid_str is not None:
+                    try:
+                        _self_wid = int(_self_wid_str)
+                        _peer_wid = 2 if _self_wid == 1 else 1
+                        _router_plan = dict(_router_plan)
+                        _router_plan["target_worker_id"] = _self_wid
+                        _router_plan["source_worker_id"] = _peer_wid
+                    except ValueError:
+                        pass
             if sampling_params.extra_args is None:
                 sampling_params.extra_args = {}
             _kvtp = sampling_params.extra_args.setdefault("kv_transfer_params", {})
             _kvtp["remote_g2_plan"] = _router_plan
-            _logging.getLogger(__name__).info(
-                "native router plan adapted: req=%s target=%s source=%s blocks=%s",
+            _logging.getLogger(__name__).debug(
+                "native router plan adapted (bridge=%s): req=%s target=%s "
+                "source=%s blocks=%s",
+                _use_bridge,
                 request.get("request_id", "?"),
                 _router_plan.get("target_worker_id"),
                 _router_plan.get("source_worker_id"),

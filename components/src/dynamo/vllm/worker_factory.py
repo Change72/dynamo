@@ -53,6 +53,137 @@ logger = logging.getLogger(__name__)
 # LLMBackendMetrics registration there.
 EngineSetupResult = tuple[AsyncLLM, VllmConfig, Any, Any, Optional[LLMBackendMetrics]]
 
+# Env flag opting this worker into the dynamic Remote-G2 transport (target
+# reaches any source via the dynamo parent bridge + client.direct, instead of
+# the static same-host peer_endpoints socket). Read by both this factory and
+# the vLLM RemoteG2OffloadingSpec / handlers.py.
+ENV_REMOTE_G2_USE_DYNAMO_BRIDGE = "REMOTE_G2_USE_DYNAMO_BRIDGE"
+ENV_REMOTE_G2_SOURCE_WORKER_ID = "REMOTE_G2_SOURCE_WORKER_ID"
+
+
+def _truthy(val: Any) -> bool:
+    # Same truthy set as vLLM's _resolve_bool so the engine and the dynamo-side
+    # readers never disagree on whether the bridge is on.
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _remote_g2_dynamic_enabled() -> bool:
+    return _truthy(os.environ.get(ENV_REMOTE_G2_USE_DYNAMO_BRIDGE, ""))
+
+
+def _remote_g2_ipc_source_socket() -> str:
+    """Canonical source-RPC IPC path the parent bridge waits for (keyed by this
+    dynamo worker's PID). Mirrors source_rpc_server._ipc_socket_path()."""
+    return f"/tmp/dynamo_remote_g2_ipc_{os.getpid()}.sock"
+
+
+def _remote_g2_target_bridge_socket() -> str:
+    """Canonical target-bridge REP path setup_target_rpc_local binds (keyed by
+    this dynamo worker's PID). Injected into the engine so worker ranks use it
+    directly instead of rediscovering via os.getppid(), which resolves to the
+    EngineCore PID (not the dynamo parent) under TP>1's grandchild layout."""
+    return f"/tmp/dynamo_remote_g2_target_{os.getpid()}.sock"
+
+
+def _canonicalize_remote_g2_dynamic_config(
+    config: "Config", fpm_worker_id: str, snapshot_engine: Any
+) -> None:
+    """Dynamic Remote-G2: rewrite the connector extra config IN PLACE before the
+    EngineCore subprocess is spawned, so the engine, the dynamo handler, and the
+    parent bridges all enter the same mode with consistent identifiers.
+
+    An env-only approach has three foot-guns this closes:
+      * RemoteG2OffloadingSpec reads ``kv_connector_extra_config.source_worker_id``
+        with higher precedence than the env, so a launcher pinning 1/2 shadows
+        the real WorkerId and every resolve fails ``wrong_source_worker``.
+      * A static ``tcp://`` source_rpc_socket_path stops the parent source
+        bridge (canonical IPC path) from ever finding the engine REP socket.
+      * Split ownership (engine=config, dynamo=env) can leave the halves in
+        different modes.
+
+    So we force source_worker_id=connection_id, the canonical IPC source
+    socket, an explicit target-bridge socket, and use_dynamo_bridge=True on
+    every RemoteG2 connector (direct + nested PdConnector); normalize the env
+    for the dynamo-side readers; and reject a pre-created engine (its subprocess
+    already exists, so the rewrite can't reach it)."""
+    from .args import _uses_remote_g2_offloading, remote_g2_extra_configs
+
+    if not _uses_remote_g2_offloading(config.engine_args):
+        return
+    extras = remote_g2_extra_configs(config.engine_args)
+
+    # Resolve ONE canonical mode from BOTH inputs: the env flag and every
+    # RemoteG2 connector's use_dynamo_bridge. A config-only opt-in must count
+    # (else vLLM would bridge while dynamo stayed static and kept rewriting to
+    # {1,2}); a mix of on/off is a hard error.
+    signals: list[bool] = []
+    env_raw = os.environ.get(ENV_REMOTE_G2_USE_DYNAMO_BRIDGE)
+    if env_raw not in (None, ""):
+        signals.append(_truthy(env_raw))
+    for extra in extras:
+        v = extra.get("use_dynamo_bridge")
+        if v is not None:
+            signals.append(_truthy(v))
+    if not signals:
+        return  # neither env nor config requested the bridge -> static, no-op
+    if any(signals) and not all(signals):
+        raise ValueError(
+            "conflicting Remote-G2 bridge mode: env "
+            f"REMOTE_G2_USE_DYNAMO_BRIDGE={env_raw!r} and connector "
+            "use_dynamo_bridge values disagree; set them consistently"
+        )
+    if not all(signals):
+        return  # everything explicitly off -> static, no-op
+
+    # --- dynamic mode ---
+    if snapshot_engine is not None:
+        raise ValueError(
+            "dynamic Remote-G2 is incompatible with a pre-created / snapshot "
+            "engine: its EngineCore subprocess is already spawned, so the "
+            "dynamic-mode connector config cannot be injected. Disable one."
+        )
+    for extra in extras:
+        if not _truthy(extra.get("enable_source_rpc", True)):
+            raise ValueError(
+                "dynamic Remote-G2 requires the source RPC bridge; "
+                "enable_source_rpc=false is incompatible with the bridge path"
+            )
+    source_sock = _remote_g2_ipc_source_socket()
+    target_sock = _remote_g2_target_bridge_socket()
+    for extra in extras:
+        prev_wid = extra.get("source_worker_id")
+        if prev_wid is not None and str(prev_wid) != str(fpm_worker_id):
+            logger.warning(
+                "RemoteG2 dynamic: overriding static source_worker_id=%s with "
+                "real Dynamo WorkerId=%s",
+                prev_wid,
+                fpm_worker_id,
+            )
+        prev_sock = extra.get("source_rpc_socket_path")
+        if prev_sock and prev_sock != source_sock:
+            logger.warning(
+                "RemoteG2 dynamic: overriding source_rpc_socket_path=%s with "
+                "canonical IPC path %s",
+                prev_sock,
+                source_sock,
+            )
+        extra["source_worker_id"] = int(fpm_worker_id)
+        extra["source_rpc_socket_path"] = source_sock
+        extra["target_bridge_socket_path"] = target_sock
+        extra["use_dynamo_bridge"] = True
+    # Normalize the env so the dynamo-side readers (handlers.py) enter the same
+    # mode with the same truthy value the engine now has in its config.
+    os.environ[ENV_REMOTE_G2_USE_DYNAMO_BRIDGE] = "1"
+    os.environ[ENV_REMOTE_G2_SOURCE_WORKER_ID] = str(fpm_worker_id)
+    logger.info(
+        "RemoteG2 dynamic bridge canonicalized: source_worker_id=%s "
+        "source_sock=%s target_bridge=%s (%d connector(s))",
+        fpm_worker_id,
+        source_sock,
+        target_sock,
+        len(extras),
+    )
+
 
 async def _wait_and_load_benchmark(bench_cfg: dict, vllm_config: VllmConfig) -> dict:
     """Wait for benchmark result files and aggregate across DP ranks."""
@@ -424,6 +555,10 @@ class WorkerFactory:
 
         # Use pre-created engine if provided (checkpoint mode), otherwise create new
         fpm_worker_id = str(generate_endpoint.connection_id())
+        # Dynamic Remote-G2: rewrite the connector config (real WorkerId,
+        # canonical IPC + target-bridge sockets, use_dynamo_bridge) before the
+        # EngineCore subprocess is spawned below. No-op unless dynamic mode.
+        _canonicalize_remote_g2_dynamic_config(config, fpm_worker_id, snapshot_engine)
         if snapshot_engine is not None:
             (
                 engine_client,
@@ -597,6 +732,7 @@ class WorkerFactory:
         # workers can reach us via client.direct(...). Kept in scope until
         # graceful shutdown so the socket stays alive.
         remote_g2_rpc_handle = None
+        remote_g2_target_handle = None
         from .args import _uses_remote_g2_offloading
 
         if _uses_remote_g2_offloading(config.engine_args):
@@ -605,12 +741,34 @@ class WorkerFactory:
             remote_g2_rpc_handle = await setup_source_rpc_endpoints(
                 runtime, config.namespace, config.component
             )
+            _dynamic = _remote_g2_dynamic_enabled()
             if remote_g2_rpc_handle is None:
-                logger.warning(
+                msg = (
                     "RemoteG2OffloadingSpec is configured but the engine "
                     "REP socket never appeared; KV-P2P endpoints not "
                     "registered for this worker."
                 )
+                # In dynamic mode the source bridge is mandatory: without it
+                # every remote resolve fails and an ON benchmark would silently
+                # degrade to recompute-only. Fail startup instead.
+                if _dynamic:
+                    raise RuntimeError("dynamic Remote-G2: " + msg)
+                logger.warning(msg)
+            # Dynamic transport: also bind the target-side parent bridge so
+            # this worker's engine can reach ANY source via client.direct(...),
+            # not just a static same-host peer. Kept in scope for the socket's
+            # lifetime, same as the source handle above.
+            if _dynamic:
+                from .kv_p2p import setup_target_rpc_local
+
+                remote_g2_target_handle = setup_target_rpc_local(
+                    runtime, config.namespace, config.component
+                )
+                if remote_g2_target_handle is None:
+                    raise RuntimeError(
+                        "dynamic Remote-G2: target REP bind failed; refusing to "
+                        "serve (cross-worker KV-P2P pulls would never resolve)"
+                    )
 
         try:
             logger.debug("Starting serve_endpoint for decode worker")
@@ -671,6 +829,12 @@ class WorkerFactory:
                     ]
                 )
 
+            # Dynamic Remote-G2: supervise the source RPC serve tasks alongside
+            # the worker's own endpoints so a bridge registration/runtime
+            # failure fails the worker closed instead of being swallowed.
+            if remote_g2_rpc_handle is not None and _remote_g2_dynamic_enabled():
+                serve_tasks.extend(remote_g2_rpc_handle.tasks)
+
             await asyncio.gather(*serve_tasks)
             logger.debug("serve_endpoint completed for decode worker")
         except Exception as e:
@@ -706,6 +870,10 @@ class WorkerFactory:
 
         # Use pre-created engine if provided (checkpoint mode), otherwise create new
         fpm_worker_id = str(generate_endpoint.connection_id())
+        # Dynamic Remote-G2: rewrite the connector config (real WorkerId,
+        # canonical IPC + target-bridge sockets, use_dynamo_bridge) before the
+        # EngineCore subprocess is spawned below. No-op unless dynamic mode.
+        _canonicalize_remote_g2_dynamic_config(config, fpm_worker_id, snapshot_engine)
         if snapshot_engine is not None:
             (
                 engine_client,
@@ -854,6 +1022,7 @@ class WorkerFactory:
         ]
 
         remote_g2_rpc_handle = None
+        remote_g2_target_handle = None
         from .args import _uses_remote_g2_offloading
 
         if _uses_remote_g2_offloading(config.engine_args):
@@ -862,12 +1031,30 @@ class WorkerFactory:
             remote_g2_rpc_handle = await setup_source_rpc_endpoints(
                 runtime, config.namespace, config.component
             )
+            _dynamic = _remote_g2_dynamic_enabled()
             if remote_g2_rpc_handle is None:
-                logger.warning(
+                msg = (
                     "RemoteG2OffloadingSpec is configured but the engine "
                     "REP socket never appeared; KV-P2P endpoints not "
                     "registered for this prefill worker."
                 )
+                if _dynamic:
+                    raise RuntimeError("dynamic Remote-G2: " + msg)
+                logger.warning(msg)
+            # Dynamic transport: also bind the target-side parent bridge so
+            # this prefill worker's engine can reach ANY source via
+            # client.direct(...). Kept in scope for the socket's lifetime.
+            if _dynamic:
+                from .kv_p2p import setup_target_rpc_local
+
+                remote_g2_target_handle = setup_target_rpc_local(
+                    runtime, config.namespace, config.component
+                )
+                if remote_g2_target_handle is None:
+                    raise RuntimeError(
+                        "dynamic Remote-G2: target REP bind failed; refusing to "
+                        "serve (cross-worker KV-P2P pulls would never resolve)"
+                    )
 
         try:
             logger.debug("Starting serve_endpoint for prefill worker")
@@ -894,6 +1081,10 @@ class WorkerFactory:
                         metrics_labels=prefill_metrics_labels,
                     )
                 )
+            # Dynamic Remote-G2: supervise the source RPC serve tasks (fail-closed).
+            if remote_g2_rpc_handle is not None and _remote_g2_dynamic_enabled():
+                serve_tasks.extend(remote_g2_rpc_handle.tasks)
+
             await asyncio.gather(*serve_tasks)
             logger.debug("serve_endpoint completed for prefill worker")
         except Exception as e:

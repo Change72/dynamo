@@ -96,6 +96,8 @@ class _TargetRpcClient:
         source_worker_id: int,
         peer_name: str = "",
         peer_connection_info: str = "",
+        peer_metadata_b64: str = "",
+        tp_rank: Optional[int] = None,
     ) -> Optional[dict]:
         """Fetch the source worker's NIXL agent identity for transfer setup.
 
@@ -120,6 +122,13 @@ class _TargetRpcClient:
             payload["peer_name"] = peer_name
         if peer_connection_info:
             payload["peer_connection_info"] = peer_connection_info
+        # vLLM Remote-G2 metadata-bytes + per-rank handshake fields (see
+        # source_rpc_server._make_metadata_handler); harmless for TRT-LLM
+        # callers that never set them.
+        if peer_metadata_b64:
+            payload["peer_metadata_b64"] = peer_metadata_b64
+        if tp_rank is not None:
+            payload["tp_rank"] = int(tp_rank)
         try:
             stream = await client.direct(payload, instance_id=source_worker_id)
             async for response in stream:
@@ -166,7 +175,7 @@ class _TargetRpcClient:
                 ids = list(client.instance_ids())
             except Exception:
                 ids = ["<query_failed>"]
-            logging.warning(
+            logging.debug(
                 "PROBE rpc_chain target_client_direct instance_id=%s endpoint=remote-g2-resolve known_ids=%s",
                 source_worker_id,
                 ids,

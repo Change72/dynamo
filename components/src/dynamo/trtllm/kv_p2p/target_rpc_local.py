@@ -88,6 +88,10 @@ def _dispatch_resolve(
     try:
         response = future.result(timeout=timeout_s)
     except Exception as exc:
+        # On timeout (or any failure) the coroutine is still scheduled on the
+        # parent loop; cancel it so a slow/dead source doesn't leak a resolve
+        # (and a lease) that the target has already given up on.
+        future.cancel()
         logging.exception("remote_g2: target REP resolve dispatch raised")
         return {"ok": False, "error": repr(exc)}
 
@@ -107,7 +111,7 @@ def _dispatch_resolve(
     # registry actually returned matching blocks. Trim each descriptor for log readability.
     descs = inner.get("descriptors") or []
     pbs = inner.get("per_block_status") or []
-    logging.warning(
+    logging.debug(
         "PROBE rpc_chain resolve_response lease_id=%s num_tokens=%s reason=%s source_generation=%s "
         "descriptors_count=%d per_block_status_count=%d  descriptors_head=%s",
         lease_id,
@@ -155,19 +159,26 @@ def _dispatch_metadata(
     except (TypeError, ValueError):
         return {"ok": False, "error": f"invalid source_worker_id: {source_worker_id!r}"}
 
-    # Pass through peer_name + peer_connection_info to enable the
-    # bidirectional NIXL handshake.
+    # Pass through the NIXL handshake fields. TRT-LLM uses peer_name +
+    # peer_connection_info (connection-info handshake); vLLM Remote-G2 uses
+    # peer_metadata_b64 + tp_rank (metadata-bytes + per-rank handshake). Forward
+    # whichever the engine sent so one bridge serves both.
     peer_name = payload.get("peer_name", "")
     peer_conn = payload.get("peer_connection_info", "")
+    peer_metadata_b64 = payload.get("peer_metadata_b64", "")
+    tp_rank = payload.get("tp_rank")
     coro = client.get_source_metadata(
         source_worker_id,
         peer_name=str(peer_name) if peer_name else "",
         peer_connection_info=str(peer_conn) if peer_conn else "",
+        peer_metadata_b64=str(peer_metadata_b64) if peer_metadata_b64 else "",
+        tp_rank=int(tp_rank) if tp_rank is not None else None,
     )
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
         response = future.result(timeout=timeout_s)
     except Exception as exc:
+        future.cancel()
         logging.exception("remote_g2: target REP metadata dispatch raised")
         return {"ok": False, "error": repr(exc)}
 
@@ -199,6 +210,7 @@ def _dispatch_release(
     try:
         response = future.result(timeout=timeout_s)
     except Exception as exc:
+        future.cancel()
         logging.exception("remote_g2: target REP release dispatch raised")
         return {"ok": False, "error": repr(exc)}
 
@@ -259,7 +271,7 @@ def setup_target_rpc_local(
                 req = pickle.loads(raw)
                 method = req.get("method") if isinstance(req, dict) else None
                 payload = (req.get("payload") or {}) if isinstance(req, dict) else {}
-                logging.warning(
+                logging.debug(
                     "PROBE rpc_chain target_rep_recv pid=%d method=%s "
                     "payload_keys=%s",
                     os.getpid(),
