@@ -153,7 +153,7 @@ pub fn select_remote_g2_reuse_plan(
         if worker == input.target {
             continue;
         }
-        if !spans.is_empty() {
+        if spans.iter().any(|span| span.end_pos > span.start_pos) {
             saw_remote_candidate = true;
         }
         for &span in spans {
@@ -186,7 +186,7 @@ pub fn select_remote_g2_reuse_plan(
     saw_remote_candidate |= host_pinned_matches
         .cross_worker_hits
         .iter()
-        .any(|(&worker, _)| worker != input.target);
+        .any(|(&worker, &hits)| worker != input.target && hits > 0);
 
     let Some((source, selected_span, useful)) = best else {
         return RemoteKvReuseDecision::NoPlan {
@@ -877,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn scenario_zero_host_pinned_hits_no_contiguous_prefix() {
+    fn scenario_zero_host_pinned_hits_no_remote_candidate() {
         let hashes = block_hashes(2);
         let target = WorkerWithDpRank::new(9, 0);
         let matches = tiered_matches(&[], &[(WorkerWithDpRank::new(7, 0), 0)]);
@@ -886,7 +886,7 @@ mod tests {
 
         match decision {
             RemoteKvReuseDecision::NoPlan { reason, .. } => {
-                assert_eq!(reason, RemoteKvReuseNoPlanReason::NoContiguousPrefix);
+                assert_eq!(reason, RemoteKvReuseNoPlanReason::NoRemoteG2Candidate);
             }
             other => panic!("expected no plan, got {other:?}"),
         }
