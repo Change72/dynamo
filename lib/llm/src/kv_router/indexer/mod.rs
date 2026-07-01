@@ -75,6 +75,14 @@ impl Indexer {
         matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. })
     }
 
+    /// Remote-G2 plans require a local lower-tier edge index to materialize
+    /// source-side external block hashes. Served/remote indexer responses do
+    /// not carry those edges or local spans yet, so explicitly disable this
+    /// experimental path instead of emitting a plan that must later guess.
+    pub(crate) fn supports_remote_g2_materialization(&self) -> bool {
+        matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. })
+    }
+
     pub async fn new(
         component: &Component,
         kv_router_config: &KvRouterConfig,
@@ -508,6 +516,9 @@ mod tests {
         assert!(make_test_indexer().supports_overlap_refresh());
         assert!(make_test_concurrent_indexer().supports_overlap_refresh());
         assert!(!Indexer::None.supports_overlap_refresh());
+        assert!(make_test_indexer().supports_remote_g2_materialization());
+        assert!(make_test_concurrent_indexer().supports_remote_g2_materialization());
+        assert!(!Indexer::None.supports_remote_g2_materialization());
     }
 
     async fn flush_indexer(indexer: &Indexer) {
@@ -1083,9 +1094,9 @@ mod tests {
     /// double-counting overlap blocks and producing cached_tokens > ISL.
     // RESOLVED: the remote-G2 cross-worker view and this dedup invariant no
     // longer share one field. `LowerTierMatchDetails.hits` is the dedup'd
-    // (Path A) view this test pins; the cross-worker (Path A+B) view lives in
-    // `cross_worker_hits`, read ONLY by `select_remote_g2_reuse_plan`. See the
-    // companion `concurrent_tiered_query_cross_worker_hits_reports_overlap`.
+    // (Path A) view this test pins; the cross-worker (Path A+B) summary and
+    // materializable spans live in `cross_worker_hits`/`cross_worker_spans`.
+    // See the companion cross-worker test below.
     #[tokio::test]
     async fn concurrent_tiered_query_does_not_double_count_device_and_lower_tier_overlap() {
         let indexer = make_test_concurrent_indexer();
@@ -1141,16 +1152,23 @@ mod tests {
     }
 
     /// Companion to the dedup test: the SAME doubly-stored blocks suppressed in
-    /// the dedup'd `hits` view MUST still appear in `cross_worker_hits`, which
-    /// `select_remote_g2_reuse_plan` reads so a remote target can pull a peer
-    /// host-pinned block even when that peer also holds it on its own GPU.
+    /// the dedup'd `hits` view MUST still appear in the cross-worker summary
+    /// and materializable spans, so a remote target can pull a peer host-pinned
+    /// block even when that peer also holds it on its own GPU.
     #[tokio::test]
     async fn concurrent_tiered_query_cross_worker_hits_reports_overlap() {
         let indexer = make_test_concurrent_indexer();
         let worker = WorkerWithDpRank::new(7, 0);
 
         indexer
-            .apply_event(store_event(7, 0, 1, &[], &[11, 12, 13], StorageTier::Device))
+            .apply_event(store_event(
+                7,
+                0,
+                1,
+                &[],
+                &[11, 12, 13],
+                StorageTier::Device,
+            ))
             .await;
         indexer
             .apply_event(store_event(
@@ -1186,6 +1204,11 @@ mod tests {
             "cross_worker_hits must expose a worker host-pinned block even when \
              its own device tier already covers it"
         );
+        assert_eq!(
+            tier.cross_worker_spans.get(&worker).map(Vec::len),
+            Some(1),
+            "local query must retain the from-root materialization span"
+        );
     }
 
     /// Native-path router LOGIC, end-to-end on the REAL query path the shim
@@ -1199,7 +1222,7 @@ mod tests {
     #[tokio::test]
     async fn native_remote_g2_plan_emitted_from_real_query() {
         use dynamo_kv_router::remote_g2_plan::{
-            select_remote_g2_reuse_plan, RemoteKvReuseDecision, RemoteKvReuseSelectionInput,
+            RemoteKvReuseDecision, RemoteKvReuseSelectionInput, select_remote_g2_reuse_plan,
         };
 
         let indexer = make_test_concurrent_indexer();
@@ -1207,7 +1230,14 @@ mod tests {
         let target = WorkerWithDpRank::new(9, 0); // has never seen the prefix
 
         indexer
-            .apply_event(store_event(7, 0, 1, &[], &[11, 12, 13], StorageTier::Device))
+            .apply_event(store_event(
+                7,
+                0,
+                1,
+                &[],
+                &[11, 12, 13],
+                StorageTier::Device,
+            ))
             .await;
         indexer
             .apply_event(store_event(
@@ -1221,11 +1251,7 @@ mod tests {
             .await;
         flush_indexer(&indexer).await;
 
-        let block_hashes = vec![
-            LocalBlockHash(11),
-            LocalBlockHash(12),
-            LocalBlockHash(13),
-        ];
+        let block_hashes = vec![LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)];
         let matches = indexer
             .find_matches_by_tier(block_hashes.clone())
             .await
@@ -1239,6 +1265,7 @@ mod tests {
             .expect("host-pinned tier present");
         assert_eq!(hp.hits.get(&source).copied().unwrap_or(0), 0);
         assert_eq!(hp.cross_worker_hits.get(&source).copied().unwrap_or(0), 3);
+        assert_eq!(hp.cross_worker_spans.get(&source).map(Vec::len), Some(1));
 
         // The REAL router predicate, fed the REAL tiered matches, emits a plan:
         // target 9 pulls source 7's host-pinned prefix.

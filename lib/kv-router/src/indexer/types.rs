@@ -222,7 +222,9 @@ impl From<WireLowerTierMatchDetails> for super::lower_tier::LowerTierMatchDetail
             hits: w.hits.into_iter().collect(),
             cross_worker_hits: w.cross_worker_hits.into_iter().collect(),
             // Local-only, not carried on the wire (like `next_continuations`).
-            cross_worker_anchors: Default::default(),
+            // A wire consumer therefore cannot construct a remote-G2 plan and
+            // must fail closed until remote materialization is implemented.
+            cross_worker_spans: Default::default(),
             next_continuations: Default::default(),
         }
     }
