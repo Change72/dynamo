@@ -879,34 +879,24 @@ def build_sampling_params(
             "native router plan adapter failed: %s", _exc
         )
 
-    # === KV-P2P plan injection (router-shim, non-openai path) ===
-    # KV-P2P plan injection (router-shim fallback): only run the local
-    # shim path if the dynamo Router did NOT already attach a native
-    # `RemoteKvReusePlan` via extra_args["remote_kv_reuse_plan"] (handled
-    # in the native adapter block earlier in this function). When the
-    # native plan is present we leave it alone; when it is absent the
-    # shim queries every peer worker's source registry and synthesises
-    # an all-hashes plan as a fallback for prebuilt dynamo binaries
-    # without remote_g2_plan.rs. If kvp2p_plan_inject is not importable
-    # the try/except short-circuits and the request runs without a plan.
-    _kvtp_now = (sampling_params.extra_args or {}).get("kv_transfer_params") or {}
-    if "remote_g2_plan" not in _kvtp_now:
+    # Legacy local-shim fallback. The native Rust router is authoritative;
+    # only opt into the shim for old 2-worker test setups that explicitly
+    # provide peer sockets. Keeping the import behind the env guard avoids
+    # an import miss and WARNING on every unplanned production request.
+    if os.environ.get("KVP2P_PEER_SOCKETS"):
         try:
-            import sys as _sys
-
-            if "/work" not in _sys.path:
-                _sys.path.insert(0, "/work")
-            from kvp2p_plan_inject import maybe_inject_plan as _kvp2p_inject
+            from dynamo.vllm.kv_p2p.plan_inject_shim import (
+                maybe_inject_plan as _kvp2p_inject,
+            )
 
             _kvp2p_inject(
-                sampling_params, request_id=str(request.get("request_id", "unknown"))
+                sampling_params,
+                request_id=str(request.get("request_id", "unknown")),
             )
         except Exception as _exc:
             import logging as _logging
 
-            _logging.getLogger(__name__).warning(
-                "kvp2p plan inject (non-openai) failed: %s", _exc
-            )
+            _logging.getLogger(__name__).warning("kvp2p plan inject failed: %s", _exc)
 
     return sampling_params
 
@@ -963,60 +953,6 @@ def build_sampling_params_openai(
     # Handle min_tokens (custom extension)
     if "min_tokens" in request and request["min_tokens"] is not None:
         sampling_params.min_tokens = request["min_tokens"]
-
-    # === KV-P2P plan injection (router-shim) ===
-    # KV-P2P plan injection (router-shim fallback): only run the local
-    # shim path if the dynamo Router did NOT already attach a native
-    # `RemoteKvReusePlan` via extra_args["remote_kv_reuse_plan"] (handled
-    # in the native adapter block earlier in this function). When the
-    # native plan is present we leave it alone; when it is absent the
-    # shim queries every peer worker's source registry and synthesises
-    # an all-hashes plan as a fallback for prebuilt dynamo binaries
-    # without remote_g2_plan.rs. If kvp2p_plan_inject is not importable
-    # the try/except short-circuits and the request runs without a plan.
-    _kvtp_now = (sampling_params.extra_args or {}).get("kv_transfer_params") or {}
-    if "remote_g2_plan" not in _kvtp_now:
-        try:
-            import sys as _sys
-
-            if "/work" not in _sys.path:
-                _sys.path.insert(0, "/work")
-            from kvp2p_plan_inject import maybe_inject_plan as _kvp2p_inject
-
-            _kvp2p_inject(
-                sampling_params, request_id=str(request.get("request_id", "unknown"))
-            )
-        except Exception as _exc:
-            import logging as _logging
-
-            _logging.getLogger(__name__).warning("kvp2p plan inject failed: %s", _exc)
-
-    # === KV-P2P plan injection (router-shim) ===
-    # KV-P2P plan injection (router-shim fallback): only run the local
-    # shim path if the dynamo Router did NOT already attach a native
-    # `RemoteKvReusePlan` via extra_args["remote_kv_reuse_plan"] (handled
-    # in the native adapter block earlier in this function). When the
-    # native plan is present we leave it alone; when it is absent the
-    # shim queries every peer worker's source registry and synthesises
-    # an all-hashes plan as a fallback for prebuilt dynamo binaries
-    # without remote_g2_plan.rs. If kvp2p_plan_inject is not importable
-    # the try/except short-circuits and the request runs without a plan.
-    _kvtp_now = (sampling_params.extra_args or {}).get("kv_transfer_params") or {}
-    if "remote_g2_plan" not in _kvtp_now:
-        try:
-            import sys as _sys
-
-            if "/work" not in _sys.path:
-                _sys.path.insert(0, "/work")
-            from kvp2p_plan_inject import maybe_inject_plan as _kvp2p_inject
-
-            _kvp2p_inject(
-                sampling_params, request_id=str(request.get("request_id", "unknown"))
-            )
-        except Exception as _exc:
-            import logging as _logging
-
-            _logging.getLogger(__name__).warning("kvp2p plan inject failed: %s", _exc)
 
     return sampling_params
 

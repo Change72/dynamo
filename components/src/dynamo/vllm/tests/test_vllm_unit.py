@@ -1036,6 +1036,27 @@ def test_build_sampling_params_maps_max_thinking_tokens():
     assert sp.thinking_token_budget == 1024
 
 
+def test_build_sampling_params_legacy_shim_is_explicit_opt_in(monkeypatch):
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "request_id": "shim-opt-in-test",
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    with patch("dynamo.vllm.kv_p2p.plan_inject_shim.maybe_inject_plan") as inject:
+        monkeypatch.delenv("KVP2P_PEER_SOCKETS", raising=False)
+        build_sampling_params(request, default_sampling_params={})
+        inject.assert_not_called()
+
+        monkeypatch.setenv("KVP2P_PEER_SOCKETS", "1=/tmp/source.sock")
+        build_sampling_params(request, default_sampling_params={})
+        inject.assert_called_once()
+
+
 def test_build_sampling_params_caps_omitted_max_tokens_to_generation_default():
     from dynamo.vllm.handlers import build_sampling_params
 
