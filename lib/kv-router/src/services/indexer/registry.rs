@@ -113,6 +113,8 @@ pub struct WorkerInfo {
     tenant_id: String,
     block_size: u32,
     endpoints: HashMap<u32, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    control_endpoints: HashMap<u32, String>,
     listeners: HashMap<u32, ListenerInfo>,
 }
 
@@ -311,6 +313,7 @@ impl ListenerRecord {
 pub struct WorkerEntry {
     key: IndexerKey,
     listeners: HashMap<u32, Arc<ListenerRecord>>,
+    control_endpoints: HashMap<u32, String>,
 }
 
 pub struct WorkerRegistry {
@@ -417,6 +420,7 @@ impl WorkerRegistry {
         tenant_id: String,
         block_size: u32,
         replay_endpoint: Option<String>,
+        control_endpoint: Option<String>,
     ) -> Result<()> {
         let key = IndexerKey {
             model_name,
@@ -490,8 +494,12 @@ impl WorkerRegistry {
                 .or_insert_with(|| WorkerEntry {
                     key: key.clone(),
                     listeners: HashMap::new(),
+                    control_endpoints: HashMap::new(),
                 });
             entry.listeners.insert(dp_rank, record.clone());
+            if let Some(endpoint) = control_endpoint {
+                entry.control_endpoints.insert(dp_rank, endpoint);
+            }
         }
 
         self.spawn_listener(instance_id, dp_rank, attempt, record);
@@ -568,6 +576,7 @@ impl WorkerRegistry {
             let record = entry.listeners.remove(&dp_rank).ok_or_else(|| {
                 anyhow::anyhow!("instance {instance_id} dp_rank {dp_rank} not found")
             })?;
+            entry.control_endpoints.remove(&dp_rank);
             let remove_worker = entry.listeners.is_empty();
             (record, remove_worker)
         };
@@ -735,6 +744,7 @@ impl WorkerRegistry {
                     tenant_id: key.tenant_id.clone(),
                     block_size,
                     endpoints,
+                    control_endpoints: worker.control_endpoints.clone(),
                     listeners,
                 })
             })
@@ -850,6 +860,7 @@ mod tests {
                 "default".to_string(),
                 1,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -881,6 +892,7 @@ mod tests {
                 "default".to_string(),
                 1,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -893,6 +905,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 1,
+                None,
                 None,
             )
             .await
@@ -930,6 +943,7 @@ mod tests {
                 "default".to_string(),
                 1,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -954,6 +968,7 @@ mod tests {
                 "default".to_string(),
                 1,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -974,6 +989,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 1,
+                None,
                 None,
             )
             .await
@@ -997,6 +1013,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 1,
+                None,
                 None,
             )
             .await
@@ -1026,6 +1043,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 1,
+                None,
                 None,
             )
             .await
@@ -1060,6 +1078,7 @@ mod tests {
                 "acme".to_string(),
                 4,
                 None,
+                Some("tcp://127.0.0.1:16670".to_string()),
             )
             .await
             .unwrap();
@@ -1073,6 +1092,7 @@ mod tests {
                 "other-tenant".to_string(),
                 8,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1083,6 +1103,10 @@ mod tests {
         let llama = workers.iter().find(|w| w.model_name == "llama3").unwrap();
         assert_eq!(llama.block_size, 4);
         assert_eq!(llama.tenant_id, "acme");
+        assert_eq!(
+            llama.control_endpoints.get(&0).map(String::as_str),
+            Some("tcp://127.0.0.1:16670")
+        );
 
         let mistral = workers.iter().find(|w| w.model_name == "mistral").unwrap();
         assert_eq!(mistral.block_size, 8);
@@ -1134,6 +1158,7 @@ mod tests {
             WorkerEntry {
                 key,
                 listeners: HashMap::new(),
+                control_endpoints: HashMap::new(),
             },
         );
 

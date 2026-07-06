@@ -975,6 +975,8 @@ mod tests {
             endpoint: Some(format!("http://worker-{worker_id}:8000")),
             kv_events_endpoint: None,
             kv_events_endpoints: HashMap::new(),
+            kv_control_endpoint: None,
+            kv_control_endpoints: HashMap::new(),
             replay_endpoint: None,
             block_size: Some(4),
             data_parallel_start_rank: None,

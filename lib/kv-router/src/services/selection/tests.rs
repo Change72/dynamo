@@ -220,6 +220,37 @@ async fn ready_and_select_report_not_ready_without_schedulable_workers() {
 }
 
 #[tokio::test]
+async fn workers_catalog_carries_kv_control_endpoints() {
+    let app = app();
+    let response = post(
+        app.clone(),
+        "/workers",
+        r#"{
+            "worker_id": 7,
+            "model_name": "model",
+            "endpoint": "http://worker-7:8000",
+            "block_size": 4,
+            "kv_control_endpoints": {
+                "0": "tcp://127.0.0.1:7777"
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .oneshot(Request::builder().uri("/workers").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["workers"][0]["kv_control_endpoints"]["0"],
+        "tcp://127.0.0.1:7777"
+    );
+}
+
+#[tokio::test]
 async fn incomplete_worker_is_accepted_but_not_schedulable() {
     let mut config = test_config();
     config.router_queue_threshold = Some(1.0);

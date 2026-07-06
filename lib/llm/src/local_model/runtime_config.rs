@@ -146,6 +146,10 @@ pub struct ModelRuntimeConfig {
     #[validate(custom(function = "validate_kv_transfer_domain"))]
     pub kv_transfer_domain: Option<String>,
 
+    /// Opaque per-DP control endpoints for framework KV transfer managers.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub kv_control_endpoints: HashMap<u32, String>,
+
     /// KV transfer topology enforcement mode selected by DGD (`required` or `preferred`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_transfer_enforcement: Option<KvTransferEnforcement>,
@@ -199,6 +203,7 @@ impl Default for ModelRuntimeConfig {
             stable_routing_id: None,
             topology_domains: HashMap::new(),
             kv_transfer_domain: None,
+            kv_control_endpoints: HashMap::new(),
             kv_transfer_enforcement: None,
             kv_transfer_preferred_weight: None,
         }
@@ -349,6 +354,10 @@ impl ModelRuntimeConfig {
 
     pub fn validate_config(&self) -> Result<(), String> {
         self.validate().map_err(|error| error.to_string())
+    }
+
+    pub fn kv_control_endpoint_for_dp_rank(&self, dp_rank: u32) -> Option<&str> {
+        self.kv_control_endpoints.get(&dp_rank).map(String::as_str)
     }
 
     pub fn set_engine_specific<T: Serialize>(&mut self, key: &str, value: T) -> anyhow::Result<()> {

@@ -104,6 +104,8 @@ pub struct RegisterRequest {
     pub dp_rank: Option<u32>,
     #[serde(default)]
     pub replay_endpoint: Option<String>,
+    #[serde(default)]
+    pub kv_control_endpoint: Option<String>,
     /// Optional per-tenant salt (Mooncake RFC #1403 `additionalsalt`).
     /// Currently accepted but not yet mixed into hashes — engines apply
     /// their own salt internally. Plumbed for forward compatibility.
@@ -189,6 +191,7 @@ async fn register(
             req.tenant_id,
             req.block_size,
             req.replay_endpoint,
+            req.kv_control_endpoint,
         )
         .await
     {
@@ -835,6 +838,7 @@ mod tests {
                 "acme".to_string(),
                 4,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -848,6 +852,7 @@ mod tests {
                 "mistral".to_string(),
                 "acme".to_string(),
                 8,
+                None,
                 None,
             )
             .await
@@ -980,6 +985,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 4,
+                None,
                 None,
             )
             .await

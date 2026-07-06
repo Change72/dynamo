@@ -649,6 +649,29 @@ where
         // come back shorter than `planned_prefix_blocks` if eviction races
         // with our walk; in that case shrink the plan to the chain length,
         // or demote to NoPlan if the chain is empty entirely.
+        let mut missing_control_endpoint_stats = None;
+        if let RemoteKvReuseDecision::Plan {
+            plan,
+            stats: plan_stats,
+        } = &mut remote_kv_reuse
+        {
+            let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
+                plan.source_worker_id,
+                plan.source_dp_rank,
+            );
+            if let Some(endpoint) = self.control_endpoint(source) {
+                plan.source_control_endpoint = Some(endpoint);
+            } else {
+                missing_control_endpoint_stats = Some(*plan_stats);
+            }
+        }
+        if let Some(stats) = missing_control_endpoint_stats {
+            remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::NoSourceControlEndpoint,
+                stats,
+            };
+        }
+
         if let RemoteKvReuseDecision::Plan {
             plan,
             stats: plan_stats,
@@ -922,6 +945,15 @@ where
         let configs = self.workers_with_configs.borrow();
         let config = configs.get(&worker_id)?;
         (config.data_parallel_size == 1).then_some(config.data_parallel_start_rank)
+    }
+
+    fn control_endpoint(&self, worker: WorkerWithDpRank) -> Option<String> {
+        let configs = self.workers_with_configs.borrow();
+        configs
+            .get(&worker.worker_id)?
+            .kv_control_endpoint_for_dp_rank(worker.dp_rank)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_string)
     }
 
     pub fn add_output_block(

@@ -137,6 +137,9 @@ pub struct WorkerCatalogRecord {
     pub kv_events_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub kv_events_endpoints: HashMap<u32, String>,
+    pub kv_control_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub kv_control_endpoints: HashMap<u32, String>,
     pub replay_endpoint: Option<String>,
     pub block_size: Option<u32>,
     pub data_parallel_start_rank: Option<u32>,
@@ -166,6 +169,8 @@ impl WorkerCatalogRecord {
             endpoint: req.endpoint,
             kv_events_endpoint: req.kv_events_endpoint,
             kv_events_endpoints: req.kv_events_endpoints,
+            kv_control_endpoint: req.kv_control_endpoint,
+            kv_control_endpoints: req.kv_control_endpoints,
             replay_endpoint: req.replay_endpoint,
             block_size: req.block_size,
             data_parallel_start_rank: req.data_parallel_start_rank,
@@ -279,6 +284,10 @@ pub struct WorkerRequest {
     #[serde(default)]
     pub kv_events_endpoints: HashMap<u32, String>,
     #[serde(default)]
+    pub kv_control_endpoint: Option<String>,
+    #[serde(default)]
+    pub kv_control_endpoints: HashMap<u32, String>,
+    #[serde(default)]
     pub replay_endpoint: Option<String>,
     #[serde(default)]
     pub block_size: Option<u32>,
@@ -314,6 +323,10 @@ pub struct WorkerPatchRequest {
     pub kv_events_endpoint: Option<String>,
     #[serde(default)]
     pub kv_events_endpoints: Option<HashMap<u32, String>>,
+    #[serde(default)]
+    pub kv_control_endpoint: Option<String>,
+    #[serde(default)]
+    pub kv_control_endpoints: Option<HashMap<u32, String>>,
     #[serde(default)]
     pub replay_endpoint: Option<String>,
     #[serde(default)]
@@ -352,6 +365,12 @@ impl WorkerCatalogRecord {
         }
         if let Some(endpoints) = patch.kv_events_endpoints {
             self.kv_events_endpoints = endpoints;
+        }
+        if patch.kv_control_endpoint.is_some() {
+            self.kv_control_endpoint = patch.kv_control_endpoint;
+        }
+        if let Some(endpoints) = patch.kv_control_endpoints {
+            self.kv_control_endpoints = endpoints;
         }
         if patch.replay_endpoint.is_some() {
             self.replay_endpoint = patch.replay_endpoint;
