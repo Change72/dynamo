@@ -52,6 +52,12 @@ enum ZmqRawKvEvent {
         medium: Option<&'static str>,
         group_idx: u32,
     },
+    #[serde(rename = "KVCacheMetadata")]
+    Metadata {
+        name: String,
+        value: String,
+        info: String,
+    },
 }
 
 pub struct ZmqKvEventSink {
@@ -285,6 +291,11 @@ fn convert_to_zmq_events(
             }]
         }
         KvCacheEventData::Cleared => vec![],
+        KvCacheEventData::Metadata(metadata) => vec![ZmqRawKvEvent::Metadata {
+            name: metadata.name.clone(),
+            value: metadata.value.clone(),
+            info: metadata.info.clone(),
+        }],
     }
 }
 
@@ -355,9 +366,10 @@ where
 #[cfg(test)]
 mod tests {
     use dynamo_kv_router::protocols::{
-        ExternalSequenceBlockHash, KvCacheEvent, KvCacheStoreData, KvCacheStoredBlockData,
-        LocalBlockHash,
+        ExternalSequenceBlockHash, KvCacheEvent, KvCacheMetadata, KvCacheStoreData,
+        KvCacheStoredBlockData, LocalBlockHash,
     };
+    use serde::Deserialize;
 
     use super::*;
 
@@ -372,6 +384,18 @@ mod tests {
                     tokens_hash: LocalBlockHash(100),
                     mm_extra_info: None,
                 }],
+            }),
+            dp_rank: 0,
+        }
+    }
+
+    fn metadata_event() -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 2,
+            data: KvCacheEventData::Metadata(KvCacheMetadata {
+                name: "control_endpoint".to_string(),
+                value: "tcp://127.0.0.1:1234".to_string(),
+                info: "mock worker".to_string(),
             }),
             dp_rank: 0,
         }
@@ -405,5 +429,39 @@ mod tests {
             panic!("expected one BlockStored event");
         };
         assert_eq!(*medium, None);
+    }
+
+    #[test]
+    fn metadata_event_is_converted_to_zmq_event() {
+        let events = convert_to_zmq_events(&metadata_event(), None, 4, StorageTier::Device);
+
+        let [ZmqRawKvEvent::Metadata { name, value, info }] = events.as_slice() else {
+            panic!("expected one KVCacheMetadata event");
+        };
+        assert_eq!(name, "control_endpoint");
+        assert_eq!(value, "tcp://127.0.0.1:1234");
+        assert_eq!(info, "mock worker");
+    }
+
+    #[test]
+    fn metadata_event_uses_vllm_wire_tag() {
+        #[derive(Deserialize)]
+        struct WireMetadata {
+            #[serde(rename = "type")]
+            event_type: String,
+            name: String,
+            value: String,
+            info: String,
+        }
+
+        let events = convert_to_zmq_events(&metadata_event(), None, 4, StorageTier::Device);
+        let payload = rmp_serde::to_vec(&events[0]).expect("metadata event should serialize");
+        let decoded: WireMetadata =
+            rmp_serde::from_slice(&payload).expect("metadata event should deserialize");
+
+        assert_eq!(decoded.event_type, "KVCacheMetadata");
+        assert_eq!(decoded.name, "control_endpoint");
+        assert_eq!(decoded.value, "tcp://127.0.0.1:1234");
+        assert_eq!(decoded.info, "mock worker");
     }
 }

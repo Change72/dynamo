@@ -114,7 +114,9 @@ fn stored_hashes(events: &[RouterEvent]) -> impl Iterator<Item = LocalBlockHash>
         .iter()
         .flat_map(|event| match &event.event.data {
             KvCacheEventData::Stored(store) => store.blocks.as_slice(),
-            KvCacheEventData::Removed(_) | KvCacheEventData::Cleared => &[],
+            KvCacheEventData::Removed(_)
+            | KvCacheEventData::Cleared
+            | KvCacheEventData::Metadata(_) => &[],
         })
         .map(|block| block.tokens_hash)
 }

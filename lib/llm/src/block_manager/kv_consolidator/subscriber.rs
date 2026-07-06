@@ -251,6 +251,6 @@ fn process_event(
             tracker.handle_clear_all();
         }
 
-        RawKvEvent::Ignored => {}
+        RawKvEvent::Metadata { .. } | RawKvEvent::Ignored => {}
     }
 }
