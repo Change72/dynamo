@@ -207,6 +207,7 @@ impl LowerTierIndexer {
                 self.clear_worker_impl(worker_blocks, event.worker_id);
                 Ok(())
             }
+            KvCacheEventData::Metadata(_) => Ok(()),
         }
     }
 

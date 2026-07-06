@@ -93,6 +93,13 @@ pub enum RawKvEvent {
         kv_cache_spec_sliding_window: Option<u32>,
     },
     AllBlocksCleared,
+    #[serde(rename = "KVCacheMetadata")]
+    Metadata {
+        name: String,
+        value: String,
+        #[serde(default)]
+        info: String,
+    },
     Ignored,
 }
 
@@ -102,6 +109,7 @@ impl RawKvEvent {
             Self::BlockStored { .. } => "stored",
             Self::BlockRemoved { .. } => "removed",
             Self::AllBlocksCleared => "cleared",
+            Self::Metadata { .. } => "metadata",
             Self::Ignored => "ignored",
         }
     }
@@ -128,7 +136,9 @@ impl RawKvEvent {
                 kv_cache_spec_kind: *kv_cache_spec_kind,
                 kv_cache_spec_sliding_window: *kv_cache_spec_sliding_window,
             },
-            Self::AllBlocksCleared | Self::Ignored => KvCacheEventMetadata::default(),
+            Self::AllBlocksCleared | Self::Metadata { .. } | Self::Ignored => {
+                KvCacheEventMetadata::default()
+            }
         }
     }
 }

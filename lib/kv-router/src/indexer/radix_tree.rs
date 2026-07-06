@@ -221,6 +221,7 @@ impl RadixTree {
                 self.clear_all_blocks(worker.worker_id);
                 Ok(())
             }
+            KvCacheEventData::Metadata(_) => Ok(()),
         }
     }
 

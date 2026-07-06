@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -13,8 +13,8 @@ use dynamo_kv_router::{
         ThreadPoolIndexer,
     },
     protocols::{
-        DpRank, ExternalSequenceBlockHash, LocalBlockHash, RouterEvent, StorageTier, WorkerId,
-        WorkerWithDpRank,
+        DpRank, ExternalSequenceBlockHash, KV_METADATA_CONTROL_ENDPOINT, KvCacheEventData,
+        LocalBlockHash, RouterEvent, StorageTier, WorkerId, WorkerWithDpRank,
     },
 };
 
@@ -24,7 +24,7 @@ pub(crate) use dynamo_kv_router::indexer::TieredMatchDetails;
 #[allow(unused_imports)]
 pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
 use dynamo_runtime::{component::Component, traits::DistributedRuntimeProvider};
-use tokio::sync::oneshot;
+use tokio::sync::{RwLock, oneshot};
 
 mod embedding_cache;
 mod lookup;
@@ -38,6 +38,8 @@ use self::remote::RemoteIndexer;
 pub use self::remote::{ServedIndexerHandle, ServedIndexerMode, ensure_served_indexer_service};
 pub use self::side::SideIndexer;
 pub(crate) use recovery::{start_subscriber, start_worker_kv_query_endpoint};
+
+pub type ControlEndpointMap = Arc<RwLock<HashMap<WorkerWithDpRank, String>>>;
 
 /// `approx` is the optional predict-on-route side indexer. It is always local
 /// to this router, even when the primary indexer is served or consumed
@@ -55,17 +57,20 @@ pub enum Indexer {
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        control_endpoints: ControlEndpointMap,
     },
     Concurrent {
         primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        control_endpoints: ControlEndpointMap,
     },
     Remote {
         primary: Arc<RemoteIndexer>,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        control_endpoints: ControlEndpointMap,
     },
     None,
 }
@@ -73,6 +78,41 @@ pub enum Indexer {
 impl Indexer {
     pub(crate) fn supports_overlap_refresh(&self) -> bool {
         matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. })
+    }
+
+    fn control_endpoints(&self) -> Option<&ControlEndpointMap> {
+        match self {
+            Self::KvIndexer { control_endpoints, .. }
+            | Self::Concurrent { control_endpoints, .. }
+            | Self::Remote { control_endpoints, .. } => Some(control_endpoints),
+            Self::None => None,
+        }
+    }
+
+    async fn record_control_endpoint(&self, worker: WorkerWithDpRank, endpoint: String) {
+        if let Some(endpoints) = self.control_endpoints() {
+            endpoints.write().await.insert(worker, endpoint);
+        }
+    }
+
+    pub(crate) async fn control_endpoint(&self, worker: WorkerWithDpRank) -> Option<String> {
+        let endpoints = self.control_endpoints()?;
+        endpoints.read().await.get(&worker).cloned()
+    }
+
+    async fn remove_control_endpoints_for_worker(&self, worker_id: WorkerId) {
+        if let Some(endpoints) = self.control_endpoints() {
+            endpoints
+                .write()
+                .await
+                .retain(|worker, _| worker.worker_id != worker_id);
+        }
+    }
+
+    async fn remove_control_endpoint_for_worker_dp_rank(&self, worker: WorkerWithDpRank) {
+        if let Some(endpoints) = self.control_endpoints() {
+            endpoints.write().await.remove(&worker);
+        }
     }
 
     pub async fn new(
@@ -91,6 +131,8 @@ impl Indexer {
                  do not combine a primary approximate indexer with a side approximate indexer"
             );
         }
+
+        let control_endpoints = Arc::new(RwLock::new(HashMap::new()));
 
         if kv_router_config.use_remote_indexer {
             let model_name = model_name
@@ -111,6 +153,7 @@ impl Indexer {
                 primary: Arc::new(remote),
                 approx,
                 primary_records_routing_decisions: !kv_router_config.use_kv_events,
+                control_endpoints,
             });
         }
 
@@ -135,6 +178,7 @@ impl Indexer {
                     ),
                     approx: None,
                     primary_records_routing_decisions: true,
+                    control_endpoints: control_endpoints.clone(),
                 });
             }
 
@@ -153,6 +197,7 @@ impl Indexer {
                 ),
                 approx: None,
                 primary_records_routing_decisions: true,
+                control_endpoints: control_endpoints.clone(),
             });
         }
 
@@ -174,6 +219,7 @@ impl Indexer {
                 ),
                 approx,
                 primary_records_routing_decisions: false,
+                control_endpoints: control_endpoints.clone(),
             });
         }
 
@@ -194,6 +240,7 @@ impl Indexer {
             ),
             approx,
             primary_records_routing_decisions: false,
+            control_endpoints,
         })
     }
 
@@ -234,6 +281,17 @@ impl Indexer {
     }
 
     pub(crate) async fn apply_event(&self, event: RouterEvent) {
+        if let KvCacheEventData::Metadata(data) = &event.event.data {
+            if data.name == KV_METADATA_CONTROL_ENDPOINT {
+                self.record_control_endpoint(
+                    WorkerWithDpRank::new(event.worker_id, event.event.dp_rank),
+                    data.value.clone(),
+                )
+                .await;
+            }
+            return;
+        }
+
         match self {
             Self::KvIndexer {
                 primary,
@@ -288,6 +346,7 @@ impl Indexer {
     }
 
     pub(crate) async fn remove_worker(&self, worker_id: WorkerId) {
+        self.remove_control_endpoints_for_worker(worker_id).await;
         match self {
             Self::KvIndexer {
                 primary,
@@ -329,6 +388,8 @@ impl Indexer {
     }
 
     pub(crate) async fn remove_worker_dp_rank(&self, worker_id: WorkerId, dp_rank: DpRank) {
+        self.remove_control_endpoint_for_worker_dp_rank(WorkerWithDpRank::new(worker_id, dp_rank))
+            .await;
         match self {
             Self::KvIndexer {
                 primary,
@@ -461,6 +522,10 @@ mod tests {
         },
     };
 
+    fn test_endpoint_map() -> super::ControlEndpointMap {
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
+    }
+
     fn make_test_indexer() -> Indexer {
         Indexer::KvIndexer {
             primary: KvIndexer::new(
@@ -471,6 +536,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(1, 4),
             approx: None,
             primary_records_routing_decisions: false,
+            control_endpoints: test_endpoint_map(),
         }
     }
 
@@ -484,6 +550,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: false,
+            control_endpoints: test_endpoint_map(),
         }
     }
 
@@ -500,6 +567,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: true,
+            control_endpoints: test_endpoint_map(),
         }
     }
 
@@ -816,6 +884,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
+            control_endpoints: test_endpoint_map(),
         };
         assert!(indexer.records_routing_decisions());
 
@@ -947,6 +1016,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
+            control_endpoints: test_endpoint_map(),
         };
 
         let primary_worker = WorkerWithDpRank::new(10, 0);

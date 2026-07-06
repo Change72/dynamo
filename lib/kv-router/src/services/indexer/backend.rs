@@ -54,6 +54,7 @@ impl Indexer {
                 primary,
                 lower_tier,
             } => match &event.event.data {
+                KvCacheEventData::Metadata(_) => {}
                 KvCacheEventData::Cleared => {
                     primary.apply_event(event.clone()).await;
                     for indexer in lower_tier.all() {
@@ -74,6 +75,7 @@ impl Indexer {
                 primary,
                 lower_tier,
             } => match &event.event.data {
+                KvCacheEventData::Metadata(_) => {}
                 KvCacheEventData::Cleared => {
                     primary.apply_event(event.clone()).await;
                     for indexer in lower_tier.all() {

@@ -303,6 +303,7 @@ impl ConcurrentRadixTree {
                 self.clear_all_blocks(lookup, worker.worker_id);
                 Ok(())
             }
+            KvCacheEventData::Metadata(_) => Ok(()),
         }
     }
 

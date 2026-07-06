@@ -658,52 +658,61 @@ where
                 plan.source_worker_id,
                 plan.source_dp_rank,
             );
-            let chain_start = plan.start_block_index as usize;
-            let chain_end = chain_start + plan.planned_prefix_blocks as usize;
-            // Starting parent_hash for the host-pinned chain: None when the
-            // source had no device-tier matches (start == 0), otherwise the
-            // device tier's last matched block_hash for this source.
-            let parent_hash = if chain_start == 0 {
-                None
+            if let Some(endpoint) = self.indexer.control_endpoint(source).await {
+                plan.source_control_endpoint = Some(endpoint);
+                let chain_start = plan.start_block_index as usize;
+                let chain_end = chain_start + plan.planned_prefix_blocks as usize;
+                // Starting parent_hash for the host-pinned chain: None when the
+                // source had no device-tier matches (start == 0), otherwise the
+                // device tier's last matched block_hash for this source.
+                let parent_hash = if chain_start == 0 {
+                    None
+                } else {
+                    tiered_matches
+                        .device
+                        .last_matched_hashes
+                        .get(&source)
+                        .copied()
+                };
+
+                let chain = self.indexer.chain_block_hashes_for_host_pinned(
+                    source,
+                    parent_hash,
+                    &g2_block_hashes[chain_start..chain_end],
+                );
+
+                // PROBE: emit at WARN so worker-side block_hash logs can be
+                // cross-referenced against planner output. Investigation-only
+                // until the hash plumbing is validated end-to-end.
+                tracing::warn!(
+                    plan_id = %plan.plan_id,
+                    source_worker_id = source.worker_id,
+                    source_dp_rank = source.dp_rank,
+                    requested_block_hashes = ?plan.block_hashes,
+                    chain_kv_block_hashes = ?chain,
+                    "PROBE remote_g2_plan kv_block_hash chain"
+                );
+
+                if chain.is_empty() {
+                    let stats_copy = *plan_stats;
+                    remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
+                        reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                        stats: stats_copy,
+                    };
+                } else {
+                    if chain.len() < chain_end - chain_start {
+                        let new_len = chain.len();
+                        plan.planned_prefix_blocks = new_len as u32;
+                        plan.block_hashes.truncate(new_len);
+                    }
+                    plan.kv_block_hashes = chain.into_iter().map(|h| h.0).collect();
+                }
             } else {
-                tiered_matches
-                    .device
-                    .last_matched_hashes
-                    .get(&source)
-                    .copied()
-            };
-
-            let chain = self.indexer.chain_block_hashes_for_host_pinned(
-                source,
-                parent_hash,
-                &g2_block_hashes[chain_start..chain_end],
-            );
-
-            // PROBE: emit at WARN so worker-side block_hash logs can be
-            // cross-referenced against planner output. Investigation-only
-            // until the hash plumbing is validated end-to-end.
-            tracing::warn!(
-                plan_id = %plan.plan_id,
-                source_worker_id = source.worker_id,
-                source_dp_rank = source.dp_rank,
-                requested_block_hashes = ?plan.block_hashes,
-                chain_kv_block_hashes = ?chain,
-                "PROBE remote_g2_plan kv_block_hash chain"
-            );
-
-            if chain.is_empty() {
                 let stats_copy = *plan_stats;
                 remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
-                    reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                    reason: RemoteKvReuseNoPlanReason::NoSourceControlEndpoint,
                     stats: stats_copy,
                 };
-            } else {
-                if chain.len() < chain_end - chain_start {
-                    let new_len = chain.len();
-                    plan.planned_prefix_blocks = new_len as u32;
-                    plan.block_hashes.truncate(new_len);
-                }
-                plan.kv_block_hashes = chain.into_iter().map(|h| h.0).collect();
             }
         }
 

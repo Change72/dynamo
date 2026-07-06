@@ -828,6 +828,7 @@ impl<S: AsyncShardHandle> KvIndexerInterface for BranchShardedIndexer<S> {
                     shard.as_ref().apply_event(event.clone()).await;
                 }
             }
+            KvCacheEventData::Metadata(_) => {}
         }
     }
 

@@ -507,6 +507,7 @@ mod tests {
             target_dp_rank: 2,
             source_worker_id: 7,
             source_dp_rank: 0,
+            source_control_endpoint: None,
             source_tier: StorageTier::HostPinned,
             block_hashes: vec![LocalBlockHash(11), LocalBlockHash(22)],
             start_block_index: 0,

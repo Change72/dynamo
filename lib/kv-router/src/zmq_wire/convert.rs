@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
-    KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, Placement, PlacementEvent,
-    StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
+    KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, KvCacheMetadata, Placement,
+    PlacementEvent, StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::types::{BlockHashValue, RawKvEvent};
@@ -26,7 +26,9 @@ pub fn convert_event(
         RawKvEvent::BlockStored { medium, .. } | RawKvEvent::BlockRemoved { medium, .. } => {
             StorageTier::from_kv_medium_or_default(medium.as_deref())
         }
-        RawKvEvent::AllBlocksCleared => StorageTier::Device,
+        RawKvEvent::AllBlocksCleared | RawKvEvent::Metadata { .. } => {
+            StorageTier::Device
+        }
         RawKvEvent::Ignored => return None,
     };
     let dp_rank = worker.dp_rank;
@@ -116,6 +118,19 @@ pub fn convert_event(
         RawKvEvent::AllBlocksCleared => KvCacheEvent {
             event_id,
             data: KvCacheEventData::Cleared,
+            dp_rank,
+        },
+        RawKvEvent::Metadata {
+            name,
+            value,
+            info,
+        } => KvCacheEvent {
+            event_id,
+            data: KvCacheEventData::Metadata(KvCacheMetadata {
+                name,
+                value,
+                info,
+            }),
             dp_rank,
         },
         RawKvEvent::Ignored => unreachable!("ignored events return before conversion"),

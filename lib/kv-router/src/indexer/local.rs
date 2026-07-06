@@ -519,7 +519,9 @@ impl LocalKvIndexer {
         let mut tail = Vec::with_capacity(buffer.len().saturating_sub(start_idx));
         for event in buffer.iter().skip(start_idx) {
             match event.event.data {
-                KvCacheEventData::Stored(_) | KvCacheEventData::Removed(_) => {
+                KvCacheEventData::Stored(_)
+                | KvCacheEventData::Removed(_)
+                | KvCacheEventData::Metadata(_) => {
                     tail.push(event.clone());
                 }
                 _ => {
@@ -667,6 +669,7 @@ impl LocalKvIndexer {
 
     async fn apply_event_by_tier(&self, event: &RouterEvent) -> Result<(), KvRouterError> {
         match &event.event.data {
+            KvCacheEventData::Metadata(_) => Ok(()),
             KvCacheEventData::Cleared => {
                 self.apply_event_to_primary(event.clone()).await?;
                 for indexer in self.all_lower_tier_indexers() {

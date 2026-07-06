@@ -31,6 +31,7 @@ pub enum EventKind {
     Stored,
     Removed,
     Cleared,
+    Metadata,
 }
 
 impl EventKind {
@@ -39,6 +40,7 @@ impl EventKind {
             KvCacheEventData::Stored(_) => Self::Stored,
             KvCacheEventData::Removed(_) => Self::Removed,
             KvCacheEventData::Cleared => Self::Cleared,
+            KvCacheEventData::Metadata(_) => Self::Metadata,
         }
     }
 }
@@ -49,6 +51,7 @@ impl std::fmt::Display for EventKind {
             Self::Stored => f.write_str(METRIC_EVENT_STORED),
             Self::Removed => f.write_str(METRIC_EVENT_REMOVED),
             Self::Cleared => f.write_str(METRIC_EVENT_CLEARED),
+            Self::Metadata => f.write_str("metadata"),
         }
     }
 }
@@ -390,6 +393,7 @@ impl PreBoundEventCounters {
                 EventKind::Stored => &self.inner.stored,
                 EventKind::Removed => &self.inner.removed,
                 EventKind::Cleared => &self.inner.cleared,
+                EventKind::Metadata => return,
             };
             counters.for_result(result).inc();
         }

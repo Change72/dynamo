@@ -132,6 +132,24 @@ pub(super) async fn run_event_processor_loop<P: RouterEventSink + Send + Sync + 
                         .await;
                         batching_state.next_publish_id += 1;
                     }
+                    KvCacheEventData::Metadata(data) => {
+                        batching_state
+                            .flush(&publisher, &local_indexer, worker_id, &mut dedup)
+                            .await;
+                        emit(
+                            &publisher,
+                            &local_indexer,
+                            worker_id,
+                            storage_tier,
+                            KvCacheEvent {
+                                event_id: batching_state.next_publish_id,
+                                data: KvCacheEventData::Metadata(data),
+                                dp_rank: event.dp_rank,
+                            },
+                        )
+                        .await;
+                        batching_state.next_publish_id += 1;
+                    }
                 }
 
                 batching_state.last_dp_rank = event.dp_rank;

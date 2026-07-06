@@ -679,6 +679,17 @@ pub enum KvCacheEventData {
     Stored(KvCacheStoreData),
     Removed(KvCacheRemoveData),
     Cleared,
+    Metadata(KvCacheMetadata),
+}
+
+pub const KV_METADATA_CONTROL_ENDPOINT: &str = "control_endpoint";
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct KvCacheMetadata {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub info: String,
 }
 
 /// Represents the data associated with a stored cache event.

@@ -51,6 +51,9 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
         let mut lora_name: Option<Option<String>> = None;
         let mut extra_keys: Option<Option<Vec<Option<Vec<ExtraKeyItem>>>>> = None;
         let mut block_mm_infos: Option<Option<Vec<Option<BlockExtraInfo>>>> = None;
+        let mut meta_name: Option<String> = None;
+        let mut meta_value: Option<String> = None;
+        let mut meta_info: Option<String> = None;
         let mut metadata = KvCacheEventMetadata::default();
 
         while let Some(key) = map.next_key::<String>()? {
@@ -90,6 +93,15 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 }
                 "kv_cache_spec_sliding_window" => {
                     metadata.kv_cache_spec_sliding_window = map.next_value()?;
+                }
+                "name" => {
+                    meta_name = Some(map.next_value()?);
+                }
+                "value" => {
+                    meta_value = Some(map.next_value()?);
+                }
+                "info" => {
+                    meta_info = Some(map.next_value()?);
                 }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
@@ -136,10 +148,21 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             Some("AllBlocksCleared") => Ok(RawKvEvent::AllBlocksCleared),
+            Some("KVCacheMetadata") => Ok(RawKvEvent::Metadata {
+                name: meta_name.ok_or_else(|| de::Error::missing_field("name"))?,
+                value: meta_value.ok_or_else(|| de::Error::missing_field("value"))?,
+                info: meta_info.unwrap_or_default(),
+            }),
             Some("Ignored") => Ok(RawKvEvent::Ignored),
             Some(other) => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "KVCacheMetadata",
+                    "Ignored",
+                ],
             )),
             None => Err(de::Error::missing_field("type")),
         }
@@ -241,13 +264,34 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::AllBlocksCleared)
             }
+            "KVCacheMetadata" => {
+                let name: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &"missing name"))?;
+                let value: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &"missing value"))?;
+                let info: String = seq.next_element()?.unwrap_or_default();
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawKvEvent::Metadata {
+                    name,
+                    value,
+                    info,
+                })
+            }
             "Ignored" => {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::Ignored)
             }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "KVCacheMetadata",
+                    "Ignored",
+                ],
             )),
         }
     }

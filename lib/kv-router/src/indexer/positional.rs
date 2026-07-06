@@ -324,6 +324,7 @@ impl PositionalIndexer {
                 self.clear_worker_blocks_impl(worker_blocks, worker_id);
                 Ok(())
             }
+            KvCacheEventData::Metadata(_) => Ok(()),
         }
     }
 
