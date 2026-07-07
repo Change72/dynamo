@@ -649,9 +649,11 @@ where
             if remote_g2_reuse_enabled() {
                 classified
             } else {
+                let mut stats = classified.stats();
+                stats.selected_opportunity_blocks = 0;
                 RemoteKvReuseDecision::NoPlan {
                     reason: RemoteKvReuseNoPlanReason::Disabled,
-                    stats: classified.stats(),
+                    stats,
                 }
             }
         } else {

@@ -324,9 +324,13 @@ where
         no_plan @ RemoteKvReuseDecision::NoPlan { .. } => return no_plan,
     };
 
-    let fail = || RemoteKvReuseDecision::NoPlan {
-        reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
-        stats,
+    let fail = || {
+        let mut failed_stats = stats;
+        failed_stats.selected_opportunity_blocks = 0;
+        RemoteKvReuseDecision::NoPlan {
+            reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+            stats: failed_stats,
+        }
     };
     let start = plan.start_block_index as usize;
     let Some(end) = start.checked_add(plan.planned_prefix_blocks as usize) else {
@@ -875,6 +879,7 @@ mod tests {
 
         let decision = materialize_remote_g2_reuse_plan(selected, &hashes, |_, _, _| Vec::new());
 
+        assert_eq!(decision.stats().selected_opportunity_blocks, 0);
         assert!(matches!(
             decision,
             RemoteKvReuseDecision::NoPlan {
