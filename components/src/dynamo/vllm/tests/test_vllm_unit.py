@@ -17,6 +17,8 @@ import pytest
 
 from dynamo.vllm.args import (
     _connector_to_kv_transfer_json,
+    _get_kvcc_control_endpoint,
+    _get_kvcc_control_endpoints,
     _is_routable,
     _uses_dynamo_connector,
     _uses_nixl_connector,
@@ -268,6 +270,54 @@ def test_uses_dynamo_connector_direct_and_nested():
     )
     assert _uses_dynamo_connector(_make_engine_cfg("NixlConnector")) is False
     assert _uses_dynamo_connector(_make_engine_cfg()) is False
+
+
+def test_get_kvcc_control_endpoint_direct_and_nested():
+    extra = {
+        "spec_name": "TieringOffloadingSpec",
+        "secondary_tiers": [
+            {
+                "type": "kvcc",
+                "control_port": 7777,
+                "control_advertise_host": "10.0.0.1",
+            }
+        ],
+    }
+
+    assert (
+        _get_kvcc_control_endpoint(_make_engine_cfg("OffloadingConnector", extra))
+        == "tcp://10.0.0.1:7777"
+    )
+    assert (
+        _get_kvcc_control_endpoint(
+            _make_engine_cfg(
+                "PdConnector",
+                {
+                    "connectors": [
+                        {
+                            "kv_connector": "OffloadingConnector",
+                            "kv_connector_extra_config": extra,
+                        }
+                    ]
+                },
+            )
+        )
+        == "tcp://10.0.0.1:7777"
+    )
+    assert _get_kvcc_control_endpoint(_make_engine_cfg()) is None
+    assert _get_kvcc_control_endpoints(
+        _make_engine_cfg("OffloadingConnector", extra), 2, 2
+    ) == {2: "tcp://10.0.0.1:7777", 3: "tcp://10.0.0.1:7777"}
+
+
+def test_get_kvcc_control_endpoint_requires_port():
+    extra = {
+        "spec_name": "TieringOffloadingSpec",
+        "secondary_tiers": [{"type": "kvcc"}],
+    }
+
+    with pytest.raises(ValueError, match="control_port"):
+        _get_kvcc_control_endpoint(_make_engine_cfg("OffloadingConnector", extra))
 
 
 def test_headless_namespace_has_required_fields(mock_vllm_cli):

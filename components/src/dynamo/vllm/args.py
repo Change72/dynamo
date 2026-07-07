@@ -413,6 +413,57 @@ def _uses_remote_g2_offloading(engine_config: AsyncEngineArgs) -> bool:
     return False
 
 
+def _get_kvcc_control_endpoint(engine_config: AsyncEngineArgs) -> Optional[str]:
+    """Return the advertised KVCC control endpoint from vLLM offload config."""
+    kv_cfg = getattr(engine_config, "kv_transfer_config", None)
+    if kv_cfg is None:
+        return None
+
+    def _from_offloading_entry(connector: str, extra: dict) -> Optional[str]:
+        if (
+            connector != "OffloadingConnector"
+            or extra.get("spec_name") != "TieringOffloadingSpec"
+        ):
+            return None
+        for tier in extra.get("secondary_tiers", []):
+            if not isinstance(tier, dict) or tier.get("type") != "kvcc":
+                continue
+            try:
+                port = int(tier.get("control_port"))
+            except (TypeError, ValueError):
+                raise ValueError("KVCC secondary tier requires control_port") from None
+            if port <= 0:
+                raise ValueError("KVCC secondary tier requires control_port > 0")
+            host = tier.get("control_advertise_host") or socket.gethostname()
+            return f"tcp://{host}:{port}"
+        return None
+
+    direct_extra = kv_cfg.kv_connector_extra_config or {}
+    endpoint = _from_offloading_entry(kv_cfg.kv_connector, direct_extra)
+    if endpoint is not None:
+        return endpoint
+    if kv_cfg.kv_connector == "PdConnector":
+        for entry in direct_extra.get("connectors", []):
+            if not isinstance(entry, dict):
+                continue
+            endpoint = _from_offloading_entry(
+                entry.get("kv_connector", ""),
+                entry.get("kv_connector_extra_config") or {},
+            )
+            if endpoint is not None:
+                return endpoint
+    return None
+
+
+def _get_kvcc_control_endpoints(
+    engine_config: AsyncEngineArgs, dp_start: int, dp_size: int
+) -> dict[int, str]:
+    endpoint = _get_kvcc_control_endpoint(engine_config)
+    if endpoint is None:
+        return {}
+    return {rank: endpoint for rank in range(dp_start, dp_start + dp_size)}
+
+
 def _uses_dynamo_connector(engine_config: AsyncEngineArgs) -> bool:
     """Check if the user-provided --kv-transfer-config uses DynamoConnector (KVBM).
 

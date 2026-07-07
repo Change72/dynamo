@@ -144,6 +144,11 @@ impl ModelRuntimeConfig {
     }
 
     #[setter]
+    fn set_kv_control_endpoints(&mut self, endpoints: HashMap<u32, String>) {
+        self.inner.kv_control_endpoints = endpoints;
+    }
+
+    #[setter]
     fn set_exclude_tools_when_tool_choice_none(
         &mut self,
         exclude_tools_when_tool_choice_none: bool,
@@ -212,6 +217,11 @@ impl ModelRuntimeConfig {
     #[getter]
     fn enable_local_indexer(&self) -> bool {
         self.inner.enable_local_indexer
+    }
+
+    #[getter]
+    fn kv_control_endpoints(&self) -> HashMap<u32, String> {
+        self.inner.kv_control_endpoints.clone()
     }
 
     #[getter]

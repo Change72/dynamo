@@ -64,7 +64,11 @@ from dynamo.llm import (
     unregister_model,
 )
 from dynamo.runtime import Endpoint
-from dynamo.vllm.args import configure_rl_logprobs_mode, parse_args
+from dynamo.vllm.args import (
+    _get_kvcc_control_endpoints,
+    configure_rl_logprobs_mode,
+    parse_args,
+)
 from dynamo.vllm.cache_info import (
     configure_kv_event_block_size,
     get_configured_kv_event_block_size,
@@ -747,6 +751,11 @@ class VllmLLMEngine(LLMEngine):
             )
             runtime_config.data_parallel_start_rank = self._dp_range[0]
             runtime_config.data_parallel_size = self._dp_range[1]
+            kvcc_endpoints = _get_kvcc_control_endpoints(
+                self.engine_args, self._dp_range[0], self._dp_range[1]
+            )
+            if kvcc_endpoints:
+                runtime_config.kv_control_endpoints = kvcc_endpoints
 
         # Publish the effective KV-event block size (computed in start() and
         # used by the base-model MDC) so LoRA block hashes match vLLM's emitted

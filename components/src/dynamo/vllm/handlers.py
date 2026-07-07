@@ -94,7 +94,7 @@ from dynamo.vllm.kv_connector_protocols import (
     make_kv_connector_protocol,
 )
 
-from .args import Config
+from .args import Config, _get_kvcc_control_endpoints
 from .constants import DisaggregationMode, EmbeddingTransferMode
 from .engine_monitor import VllmEngineMonitor
 from .multimodal_utils.hash_utils import compute_mm_uuids_from_images
@@ -2166,6 +2166,13 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             runtime_config.reasoning_parser = (
                                 self.config.dyn_reasoning_parser
                             )
+                            kvcc_endpoints = _get_kvcc_control_endpoints(
+                                self.config.engine_args,
+                                self.dp_range[0],
+                                self.dp_range[1],
+                            )
+                            if kvcc_endpoints:
+                                runtime_config.kv_control_endpoints = kvcc_endpoints
 
                             # Match the base-model registration topology (see
                             # worker_factory.py _create_decode_worker /

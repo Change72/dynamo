@@ -50,7 +50,13 @@ from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.vllm.worker_factory import WorkerFactory
 
 from . import envs
-from .args import Config, _uses_dynamo_connector, configure_rl_logprobs_mode, parse_args
+from .args import (
+    Config,
+    _get_kvcc_control_endpoints,
+    _uses_dynamo_connector,
+    configure_rl_logprobs_mode,
+    parse_args,
+)
 from .cache_info import get_configured_kv_event_block_size
 from .capacity import (
     get_metrics_model_name,
@@ -767,6 +773,11 @@ async def register_vllm_model(
 
     runtime_config.data_parallel_start_rank = dp_range[0]
     runtime_config.data_parallel_size = dp_range[1]
+    kvcc_endpoints = _get_kvcc_control_endpoints(
+        config.engine_args, dp_range[0], dp_range[1]
+    )
+    if kvcc_endpoints:
+        runtime_config.kv_control_endpoints = kvcc_endpoints
 
     # Set topology and KV transfer policy for topology-aware routing
     apply_topology_config(runtime_config)
