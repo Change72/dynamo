@@ -84,6 +84,23 @@ pub struct RemoteKvReuseSelectionInput<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RemoteKvReuseSelectionStats {
     pub rejected_g1_candidates: u32,
+    /// At least one non-target worker reports any host-pinned KV for the
+    /// request, regardless of whether that KV is usable at the target's next
+    /// missing block.
+    pub raw_remote_candidate: bool,
+    /// Number of contiguous blocks available from the best non-target source
+    /// beyond everything the selected target already owns locally (G1 plus
+    /// its own contiguous host-pinned extension). Zero means there is no
+    /// strict Remote-G2 opportunity for this target.
+    pub opportunity_blocks: u32,
+    /// Strict-opportunity blocks covered by the selected plan's exact source
+    /// span after materialization. This is deliberately distinct from
+    /// `opportunity_blocks`: another source may provide an opportunity even
+    /// when the selected plan does not use it.
+    pub selected_opportunity_blocks: u32,
+    /// Complete local prefix already owned by the target across G1 and local
+    /// host-pinned G2. Retained for diagnostics and invariant tests.
+    pub target_local_prefix_blocks: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,31 +119,17 @@ pub enum RemoteKvReuseDecision {
     },
 }
 
+impl RemoteKvReuseDecision {
+    pub fn stats(&self) -> RemoteKvReuseSelectionStats {
+        match self {
+            Self::Plan { stats, .. } | Self::NoPlan { stats, .. } => *stats,
+        }
+    }
+}
+
 pub fn select_remote_g2_reuse_plan(
     input: RemoteKvReuseSelectionInput<'_>,
 ) -> RemoteKvReuseDecision {
-    let stats = RemoteKvReuseSelectionStats {
-        rejected_g1_candidates: input
-            .tiered_matches
-            .device
-            .overlap_scores
-            .scores
-            .values()
-            .filter(|&&overlap| overlap > 0)
-            .count() as u32,
-    };
-
-    let Some(host_pinned_matches) = input
-        .tiered_matches
-        .lower_tier
-        .get(&StorageTier::HostPinned)
-    else {
-        return RemoteKvReuseDecision::NoPlan {
-            reason: RemoteKvReuseNoPlanReason::NoRemoteG2Candidate,
-            stats,
-        };
-    };
-
     let request_blocks = input.block_hashes.len();
     let target_device_match = (input
         .tiered_matches
@@ -138,19 +141,85 @@ pub fn select_remote_g2_reuse_plan(
         .unwrap_or(0) as usize)
         .min(request_blocks);
 
+    let Some(host_pinned_matches) = input
+        .tiered_matches
+        .lower_tier
+        .get(&StorageTier::HostPinned)
+    else {
+        return RemoteKvReuseDecision::NoPlan {
+            reason: RemoteKvReuseNoPlanReason::NoRemoteG2Candidate,
+            stats: RemoteKvReuseSelectionStats {
+                rejected_g1_candidates: input
+                    .tiered_matches
+                    .device
+                    .overlap_scores
+                    .scores
+                    .values()
+                    .filter(|&&overlap| overlap > 0)
+                    .count() as u32,
+                target_local_prefix_blocks: target_device_match as u32,
+                ..Default::default()
+            },
+        };
+    };
+
+    let target_host_extension = host_pinned_matches
+        .hits
+        .get(&input.target)
+        .copied()
+        .unwrap_or(0);
+    let target_local_prefix = target_device_match
+        .saturating_add(target_host_extension)
+        .min(request_blocks);
+    let mut raw_remote_candidate = false;
+    let mut opportunity_blocks = 0usize;
+    for (&worker, spans) in &host_pinned_matches.cross_worker_spans {
+        if worker == input.target {
+            continue;
+        }
+        for &span in spans {
+            let end = span.end_pos.min(request_blocks);
+            if end > span.start_pos {
+                raw_remote_candidate = true;
+            }
+            if target_local_prefix < request_blocks
+                && span.start_pos <= target_local_prefix
+                && end > target_local_prefix
+            {
+                opportunity_blocks = opportunity_blocks.max(end - target_local_prefix);
+            }
+        }
+    }
+    // Wire-inbound results have no materializable spans. They are raw
+    // candidates only and deliberately cannot become strict opportunities.
+    raw_remote_candidate |= host_pinned_matches
+        .cross_worker_hits
+        .iter()
+        .any(|(&worker, &hits)| worker != input.target && hits > 0);
+    let mut stats = RemoteKvReuseSelectionStats {
+        rejected_g1_candidates: input
+            .tiered_matches
+            .device
+            .overlap_scores
+            .scores
+            .values()
+            .filter(|&&overlap| overlap > 0)
+            .count() as u32,
+        raw_remote_candidate,
+        opportunity_blocks: opportunity_blocks as u32,
+        selected_opportunity_blocks: 0,
+        target_local_prefix_blocks: target_local_prefix as u32,
+    };
+
     // Plan selection is target-relative. Raw lower-tier hit counts cannot be
     // ranked before the target is known: a long source span may end before the
     // target's local prefix, while a shorter span beginning at that boundary is
     // fully useful. A span is consumable only when it covers the very next
     // target block; vLLM's maximal-prefix lookup stops on the first gap.
-    let mut saw_remote_candidate = false;
     let mut best: Option<(WorkerWithDpRank, CrossWorkerSpan, usize)> = None;
     for (&worker, spans) in &host_pinned_matches.cross_worker_spans {
         if worker == input.target {
             continue;
-        }
-        if spans.iter().any(|span| span.end_pos > span.start_pos) {
-            saw_remote_candidate = true;
         }
         for &span in spans {
             let end = span.end_pos.min(request_blocks);
@@ -179,14 +248,9 @@ pub fn select_remote_g2_reuse_plan(
     // Wire-inbound results currently carry only the raw summary and no local
     // materialization spans. Count them as candidates, but never guess their
     // anchors: they must fail closed until remote materialization is supported.
-    saw_remote_candidate |= host_pinned_matches
-        .cross_worker_hits
-        .iter()
-        .any(|(&worker, &hits)| worker != input.target && hits > 0);
-
     let Some((source, selected_span, useful)) = best else {
         return RemoteKvReuseDecision::NoPlan {
-            reason: if saw_remote_candidate {
+            reason: if stats.raw_remote_candidate {
                 RemoteKvReuseNoPlanReason::NoContiguousPrefix
             } else {
                 RemoteKvReuseNoPlanReason::NoRemoteG2Candidate
@@ -198,6 +262,9 @@ pub fn select_remote_g2_reuse_plan(
     let start = target_device_match;
     let end = start + useful;
     let planned_prefix_blocks = useful as u32;
+    if selected_span.start_pos <= target_local_prefix && end > target_local_prefix {
+        stats.selected_opportunity_blocks = (end - target_local_prefix) as u32;
+    }
 
     RemoteKvReuseDecision::Plan {
         plan: RemoteKvReusePlan {
@@ -248,7 +315,7 @@ where
         &[LocalBlockHash],
     ) -> Vec<ExternalSequenceBlockHash>,
 {
-    let (mut plan, stats, selected_span) = match decision {
+    let (mut plan, mut stats, selected_span) = match decision {
         RemoteKvReuseDecision::Plan {
             plan,
             stats,
@@ -296,6 +363,16 @@ where
         .iter()
         .map(|hash| hash.0)
         .collect();
+    let materialized_end = start + materialized;
+    let target_local_prefix = stats.target_local_prefix_blocks as usize;
+    stats.selected_opportunity_blocks = if selected_span.start_pos <= target_local_prefix
+        && start <= target_local_prefix
+        && materialized_end > target_local_prefix
+    {
+        (materialized_end - target_local_prefix) as u32
+    } else {
+        0
+    };
 
     RemoteKvReuseDecision::Plan {
         plan,
@@ -590,6 +667,119 @@ mod tests {
     }
 
     #[test]
+    fn opportunity_starts_after_target_local_g1_and_g2_prefix() {
+        let hashes = block_hashes(6);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let mut matches = tiered_matches(&[(target, 2)], &[(source, 6)]);
+        matches
+            .lower_tier
+            .get_mut(&StorageTier::HostPinned)
+            .unwrap()
+            .hits
+            .insert(target, 2);
+
+        let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+        let stats = decision.stats();
+
+        assert!(stats.raw_remote_candidate);
+        assert_eq!(stats.target_local_prefix_blocks, 4);
+        assert_eq!(stats.opportunity_blocks, 2);
+        assert_eq!(stats.selected_opportunity_blocks, 2);
+    }
+
+    #[test]
+    fn selected_plan_is_not_attributed_to_a_disconnected_opportunity() {
+        let hashes = block_hashes(6);
+        let target = WorkerWithDpRank::new(9, 0);
+        let selected_source = WorkerWithDpRank::new(7, 0);
+        let opportunity_source = WorkerWithDpRank::new(8, 0);
+        let mut matches = tiered_matches(
+            &[(target, 2), (opportunity_source, 4)],
+            &[(selected_source, 3), (opportunity_source, 1)],
+        );
+        matches
+            .lower_tier
+            .get_mut(&StorageTier::HostPinned)
+            .unwrap()
+            .hits
+            .insert(target, 2);
+
+        let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+        let stats = decision.stats();
+
+        assert_eq!(stats.target_local_prefix_blocks, 4);
+        assert_eq!(stats.opportunity_blocks, 1);
+        assert_eq!(stats.selected_opportunity_blocks, 0);
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.source_worker_id, selected_source.worker_id);
+                assert_eq!(plan.start_block_index, 2);
+                assert_eq!(plan.planned_prefix_blocks, 1);
+            }
+            other => panic!("expected plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialization_shrink_recomputes_selected_opportunity_coverage() {
+        let hashes = block_hashes(6);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let mut matches = tiered_matches(&[(target, 2)], &[(source, 6)]);
+        matches
+            .lower_tier
+            .get_mut(&StorageTier::HostPinned)
+            .unwrap()
+            .hits
+            .insert(target, 2);
+        let selected = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+        assert_eq!(selected.stats().selected_opportunity_blocks, 2);
+
+        let materialized = materialize_remote_g2_reuse_plan(
+            selected,
+            &hashes,
+            |_source, _parent_hash, requested| {
+                requested
+                    .iter()
+                    .take(4)
+                    .map(|hash| ExternalSequenceBlockHash(hash.0))
+                    .collect()
+            },
+        );
+
+        assert_eq!(materialized.stats().selected_opportunity_blocks, 0);
+        match materialized {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(plan.start_block_index, 2);
+                assert_eq!(plan.planned_prefix_blocks, 2);
+            }
+            other => panic!("expected shortened plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_local_g2_full_coverage_is_not_remote_opportunity() {
+        let hashes = block_hashes(5);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let mut matches = tiered_matches(&[(target, 2)], &[(source, 5)]);
+        matches
+            .lower_tier
+            .get_mut(&StorageTier::HostPinned)
+            .unwrap()
+            .hits
+            .insert(target, 3);
+
+        let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+        let stats = decision.stats();
+
+        assert!(stats.raw_remote_candidate);
+        assert_eq!(stats.target_local_prefix_blocks, 5);
+        assert_eq!(stats.opportunity_blocks, 0);
+    }
+
+    #[test]
     fn select_useful_source_beats_larger_unusable_raw_hit_count() {
         let hashes = block_hashes(6);
         let target = WorkerWithDpRank::new(9, 0);
@@ -664,6 +854,8 @@ mod tests {
 
         let decision = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
 
+        assert!(decision.stats().raw_remote_candidate);
+        assert_eq!(decision.stats().opportunity_blocks, 0);
         assert!(matches!(
             decision,
             RemoteKvReuseDecision::NoPlan {

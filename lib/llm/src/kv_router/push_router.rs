@@ -17,7 +17,10 @@ use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
 use crate::{
-    kv_router::{KvRouter, attach_remote_kv_reuse_decision, metrics::RouterRequestMetrics},
+    kv_router::{
+        KvRouter, RemoteKvReuseAttachmentOutcome, attach_remote_kv_reuse_decision,
+        metrics::RouterRequestMetrics,
+    },
     preprocessor::PreprocessedRequest,
     protocols::common::{
         llm_backend::LLMEngineOutput,
@@ -282,9 +285,18 @@ impl KvPushRouter {
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
         // Attach the remote-G2 (KV-P2P) reuse decision computed during worker
         // selection so the chosen worker can act on the reuse plan.
-        if let Err(error) =
-            attach_remote_kv_reuse_decision(&mut backend_input, &selection.remote_kv_reuse)
-        {
+        let remote_g2_attachment =
+            attach_remote_kv_reuse_decision(&mut backend_input, &selection.remote_kv_reuse);
+        if let Some(metrics) = RouterRequestMetrics::get() {
+            metrics.observe_remote_g2_attachment(
+                &selection.remote_kv_reuse,
+                matches!(
+                    &remote_g2_attachment,
+                    Ok(RemoteKvReuseAttachmentOutcome::PlanAttached)
+                ),
+            );
+        }
+        if let Err(error) = remote_g2_attachment {
             tracing::warn!(
                 request_id = %context_id,
                 error = %error,

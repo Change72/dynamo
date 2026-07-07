@@ -139,20 +139,29 @@ fn remote_g2_reuse_enabled() -> bool {
 pub(crate) fn attach_remote_kv_reuse_decision(
     request: &mut PreprocessedRequest,
     decision: &RemoteKvReuseDecision,
-) -> serde_json::Result<()> {
+) -> serde_json::Result<RemoteKvReuseAttachmentOutcome> {
     match decision {
         RemoteKvReuseDecision::Plan { plan, .. } => {
             if request.attach_remote_kv_reuse_plan(plan).is_ok() {
-                return Ok(());
+                return Ok(RemoteKvReuseAttachmentOutcome::PlanAttached);
             }
             request.attach_remote_kv_reuse_no_plan_reason(
                 RemoteKvReuseNoPlanReason::SerializationFailed,
-            )
+            )?;
+            Ok(RemoteKvReuseAttachmentOutcome::PlanSerializationFailed)
         }
         RemoteKvReuseDecision::NoPlan { reason, .. } => {
-            request.attach_remote_kv_reuse_no_plan_reason(reason.clone())
+            request.attach_remote_kv_reuse_no_plan_reason(reason.clone())?;
+            Ok(RemoteKvReuseAttachmentOutcome::NoPlanAttached)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteKvReuseAttachmentOutcome {
+    PlanAttached,
+    PlanSerializationFailed,
+    NoPlanAttached,
 }
 
 // [gluo TODO] shouldn't need to be public
@@ -627,23 +636,30 @@ where
         // worker as the target and the retained tiered matches to find a remote
         // host-pinned source. Always produces a decision (NoPlan when disabled).
         let created_at_ms = unix_epoch_ms();
-        let mut remote_kv_reuse =
-            if remote_g2_reuse_enabled() && self.indexer.supports_remote_g2_materialization() {
-                select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
-                    request_id: context_id.unwrap_or_default(),
-                    target: response.best_worker,
-                    block_hashes: &g2_block_hashes,
-                    block_size_tokens: self.block_size,
-                    tiered_matches: &tiered_matches,
-                    created_at_ms,
-                    expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
-                })
+        let mut remote_kv_reuse = if self.indexer.supports_remote_g2_materialization() {
+            let classified = select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+                request_id: context_id.unwrap_or_default(),
+                target: response.best_worker,
+                block_hashes: &g2_block_hashes,
+                block_size_tokens: self.block_size,
+                tiered_matches: &tiered_matches,
+                created_at_ms,
+                expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
+            });
+            if remote_g2_reuse_enabled() {
+                classified
             } else {
                 RemoteKvReuseDecision::NoPlan {
                     reason: RemoteKvReuseNoPlanReason::Disabled,
-                    stats: RemoteKvReuseSelectionStats::default(),
+                    stats: classified.stats(),
                 }
-            };
+            }
+        } else {
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::Disabled,
+                stats: RemoteKvReuseSelectionStats::default(),
+            }
+        };
 
         // Post-selection materialization uses the exact span selected above;
         // it never re-derives an anchor from a different Path-A/Path-B view.
