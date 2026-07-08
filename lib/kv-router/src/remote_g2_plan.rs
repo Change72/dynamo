@@ -119,11 +119,31 @@ pub fn select_remote_g2_reuse_plan(
         .lower_tier
         .get(&StorageTier::HostPinned)
     else {
+        tracing::warn!(
+            request_id = %input.request_id,
+            target = ?input.target,
+            request_blocks = input.block_hashes.len(),
+            block_hashes = ?input.block_hashes,
+            device_scores = ?input.tiered_matches.device.overlap_scores.scores,
+            "PROBE remote_g2_plan no host-pinned tier"
+        );
         return RemoteKvReuseDecision::NoPlan {
             reason: RemoteKvReuseNoPlanReason::NoRemoteG2Candidate,
             stats,
         };
     };
+
+    tracing::warn!(
+        request_id = %input.request_id,
+        target = ?input.target,
+        request_blocks = input.block_hashes.len(),
+        block_hashes = ?input.block_hashes,
+        device_scores = ?input.tiered_matches.device.overlap_scores.scores,
+        host_hits = ?host_pinned_matches.hits,
+        host_cross_worker_hits = ?host_pinned_matches.cross_worker_hits,
+        host_next_continuations = ?host_pinned_matches.next_continuations,
+        "PROBE remote_g2_plan selection input"
+    );
 
     let mut saw_remote_candidate = false;
     let mut best: Option<(WorkerWithDpRank, usize)> = None;
@@ -147,6 +167,13 @@ pub fn select_remote_g2_reuse_plan(
     }
 
     let Some((source, hits)) = best else {
+        tracing::warn!(
+            request_id = %input.request_id,
+            target = ?input.target,
+            saw_remote_candidate,
+            host_cross_worker_hits = ?host_pinned_matches.cross_worker_hits,
+            "PROBE remote_g2_plan no selected source"
+        );
         return RemoteKvReuseDecision::NoPlan {
             reason: if saw_remote_candidate {
                 RemoteKvReuseNoPlanReason::NoContiguousPrefix
@@ -207,6 +234,21 @@ pub fn select_remote_g2_reuse_plan(
     let source_hp_end = source_hp_start.saturating_add(hits as usize);
     let useful_source_hp = source_hp_end.saturating_sub(start);
     let planned_prefix_blocks = useful_source_hp.min(available_after_target_device) as u32;
+    tracing::warn!(
+        request_id = %input.request_id,
+        target = ?input.target,
+        source = ?source,
+        hits,
+        target_device_match,
+        source_hp_start,
+        request_blocks,
+        start,
+        source_hp_end,
+        useful_source_hp,
+        available_after_target_device,
+        planned_prefix_blocks,
+        "PROBE remote_g2_plan window math"
+    );
     if planned_prefix_blocks == 0 {
         return RemoteKvReuseDecision::NoPlan {
             reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
