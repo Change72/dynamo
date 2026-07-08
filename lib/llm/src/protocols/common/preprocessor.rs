@@ -409,10 +409,7 @@ impl PreprocessedEmbeddingRequest {
 
 #[cfg(test)]
 mod tests {
-    use dynamo_kv_router::{
-        protocols::{LocalBlockHash, StorageTier},
-        remote_g2_plan::REMOTE_KV_REUSE_PLAN_VERSION,
-    };
+    use dynamo_kv_router::protocols::ExternalSequenceBlockHash;
     use serde_json::json;
 
     use super::*;
@@ -501,22 +498,10 @@ mod tests {
 
     fn test_plan() -> RemoteKvReusePlan {
         RemoteKvReusePlan {
-            plan_id: "plan-1".to_string(),
             request_id: "request-1".to_string(),
-            target_worker_id: 42,
-            target_dp_rank: 2,
-            source_worker_id: 7,
-            source_dp_rank: 0,
-            source_control_endpoint: None,
-            source_tier: StorageTier::HostPinned,
-            block_hashes: vec![LocalBlockHash(11), LocalBlockHash(22)],
+            source_control_endpoint: "tcp://source:1234".to_string(),
+            block_hashes: vec![ExternalSequenceBlockHash(11), ExternalSequenceBlockHash(22)],
             start_block_index: 0,
-            planned_prefix_blocks: 2,
-            block_size_tokens: 16,
-            created_at_ms: 1000,
-            expires_at_ms: 2000,
-            plan_version: REMOTE_KV_REUSE_PLAN_VERSION,
-            kv_block_hashes: vec![],
         }
     }
 
@@ -528,8 +513,8 @@ mod tests {
         let extra_args = request.extra_args.unwrap();
         assert_eq!(extra_args["existing_key"], "existing_value");
         assert_eq!(
-            extra_args[REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY]["source_tier"],
-            "host_pinned"
+            extra_args[REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY]["source_control_endpoint"],
+            "tcp://source:1234"
         );
     }
 

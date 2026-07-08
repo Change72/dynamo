@@ -1,12 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::HashSet,
-    env,
-    sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, env, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -20,8 +15,8 @@ use dynamo_kv_router::{
         WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
     },
     remote_g2_plan::{
-        RemoteKvReuseDecision, RemoteKvReuseNoPlanReason, RemoteKvReuseSelectionInput,
-        RemoteKvReuseSelectionStats, select_remote_g2_reuse_plan,
+        RemoteKvReuseDecision, RemoteKvReuseNoPlanReason, RemoteKvReusePlan,
+        RemoteKvReuseSelectionInput, RemoteKvReuseSelectionStats, select_remote_g2_reuse_plan,
     },
     scheduling::{
         CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, ScheduleMode,
@@ -117,15 +112,7 @@ fn cache_hit_for_worker(
     }
 }
 
-const REMOTE_KV_REUSE_PLAN_TTL_MS: u64 = 30_000;
 const REMOTE_G2_REUSE_ENABLED_ENV: &str = "DYN_REMOTE_G2_REUSE_ENABLED";
-
-fn unix_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
-        .unwrap_or_default()
-}
 
 fn remote_g2_reuse_enabled() -> bool {
     env::var(REMOTE_G2_REUSE_ENABLED_ENV)
@@ -141,6 +128,8 @@ pub(crate) fn attach_remote_kv_reuse_decision(
     decision: &RemoteKvReuseDecision,
 ) -> serde_json::Result<()> {
     match decision {
+        RemoteKvReuseDecision::Candidate { .. } => request
+            .attach_remote_kv_reuse_no_plan_reason(RemoteKvReuseNoPlanReason::SerializationFailed),
         RemoteKvReuseDecision::Plan { plan, .. } => {
             if request.attach_remote_kv_reuse_plan(plan).is_ok() {
                 return Ok(());
@@ -623,19 +612,17 @@ where
             Err(error) => return Err(map_scheduler_error(error)),
         };
 
-        // Remote-G2 (KV-P2P) reuse plan selection. Uses the scheduler's chosen
+        // Remote-G2 (KV-P2P) reuse selection. Uses the scheduler's chosen
         // worker as the target and the retained tiered matches to find a remote
-        // host-pinned source. Always produces a decision (NoPlan when disabled).
-        let created_at_ms = unix_epoch_ms();
+        // host-pinned source. Selection returns an internal candidate; the wire
+        // plan is only created after we resolve the source control location and
+        // source-side external block hashes.
         let mut remote_kv_reuse = if remote_g2_reuse_enabled() {
             select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
                 request_id: context_id.unwrap_or_default(),
                 target: response.best_worker,
                 block_hashes: &g2_block_hashes,
-                block_size_tokens: self.block_size,
                 tiered_matches: &tiered_matches,
-                created_at_ms,
-                expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
             })
         } else {
             RemoteKvReuseDecision::NoPlan {
@@ -644,91 +631,68 @@ where
             }
         };
 
-        // Post-selection: extract the chosen source's host-pinned chain of
-        // TRT-LLM-side block_hashes and populate the plan. The chain may
-        // come back shorter than `planned_prefix_blocks` if eviction races
-        // with our walk; in that case shrink the plan to the chain length,
-        // or demote to NoPlan if the chain is empty entirely.
-        let mut missing_control_endpoint_stats = None;
-        if let RemoteKvReuseDecision::Plan {
-            plan,
-            stats: plan_stats,
-        } = &mut remote_kv_reuse
-        {
-            let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
-                plan.source_worker_id,
-                plan.source_dp_rank,
-            );
-            if let Some(endpoint) = self.control_endpoint(source) {
-                plan.source_control_endpoint = Some(endpoint);
-            } else {
-                missing_control_endpoint_stats = Some(*plan_stats);
-            }
-        }
-        if let Some(stats) = missing_control_endpoint_stats {
-            remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
-                reason: RemoteKvReuseNoPlanReason::NoSourceControlEndpoint,
-                stats,
-            };
-        }
+        remote_kv_reuse = match remote_kv_reuse {
+            RemoteKvReuseDecision::Candidate { candidate, stats } => {
+                let source = candidate.source;
+                match self.control_endpoint(source) {
+                    None => RemoteKvReuseDecision::NoPlan {
+                        reason: RemoteKvReuseNoPlanReason::NoSourceControlEndpoint,
+                        stats,
+                    },
+                    Some(source_control_endpoint) => {
+                        let chain_start = candidate.start_block_index as usize;
+                        // Starting parent_hash for the host-pinned chain: None when the
+                        // source had no device-tier matches (start == 0), otherwise the
+                        // device tier's last matched block_hash for this source.
+                        let parent_hash = if chain_start == 0 {
+                            None
+                        } else {
+                            tiered_matches
+                                .device
+                                .last_matched_hashes
+                                .get(&source)
+                                .copied()
+                        };
 
-        if let RemoteKvReuseDecision::Plan {
-            plan,
-            stats: plan_stats,
-        } = &mut remote_kv_reuse
-        {
-            let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
-                plan.source_worker_id,
-                plan.source_dp_rank,
-            );
-            let chain_start = plan.start_block_index as usize;
-            let chain_end = chain_start + plan.planned_prefix_blocks as usize;
-            // Starting parent_hash for the host-pinned chain: None when the
-            // source had no device-tier matches (start == 0), otherwise the
-            // device tier's last matched block_hash for this source.
-            let parent_hash = if chain_start == 0 {
-                None
-            } else {
-                tiered_matches
-                    .device
-                    .last_matched_hashes
-                    .get(&source)
-                    .copied()
-            };
+                        let chain = self.indexer.chain_block_hashes_for_host_pinned(
+                            source,
+                            parent_hash,
+                            &candidate.routing_block_hashes,
+                        );
 
-            let chain = self.indexer.chain_block_hashes_for_host_pinned(
-                source,
-                parent_hash,
-                &g2_block_hashes[chain_start..chain_end],
-            );
+                        // PROBE: emit at WARN so worker-side block_hash logs can be
+                        // cross-referenced against planner output. Investigation-only
+                        // until the hash plumbing is validated end-to-end.
+                        tracing::warn!(
+                            request_id = %candidate.request_id,
+                            source_worker_id = source.worker_id,
+                            source_dp_rank = source.dp_rank,
+                            requested_block_hashes = ?candidate.routing_block_hashes,
+                            source_block_hashes = ?chain,
+                            "PROBE remote_g2_plan external block_hash chain"
+                        );
 
-            // PROBE: emit at WARN so worker-side block_hash logs can be
-            // cross-referenced against planner output. Investigation-only
-            // until the hash plumbing is validated end-to-end.
-            tracing::warn!(
-                plan_id = %plan.plan_id,
-                source_worker_id = source.worker_id,
-                source_dp_rank = source.dp_rank,
-                requested_block_hashes = ?plan.block_hashes,
-                chain_kv_block_hashes = ?chain,
-                "PROBE remote_g2_plan kv_block_hash chain"
-            );
-
-            if chain.is_empty() {
-                let stats_copy = *plan_stats;
-                remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
-                    reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
-                    stats: stats_copy,
-                };
-            } else {
-                if chain.len() < chain_end - chain_start {
-                    let new_len = chain.len();
-                    plan.planned_prefix_blocks = new_len as u32;
-                    plan.block_hashes.truncate(new_len);
+                        if chain.is_empty() {
+                            RemoteKvReuseDecision::NoPlan {
+                                reason: RemoteKvReuseNoPlanReason::NoContiguousPrefix,
+                                stats,
+                            }
+                        } else {
+                            RemoteKvReuseDecision::Plan {
+                                plan: RemoteKvReusePlan {
+                                    request_id: candidate.request_id,
+                                    source_control_endpoint,
+                                    block_hashes: chain,
+                                    start_block_index: candidate.start_block_index,
+                                },
+                                stats,
+                            }
+                        }
+                    }
                 }
-                plan.kv_block_hashes = chain.into_iter().map(|h| h.0).collect();
             }
-        }
+            decision => decision,
+        };
 
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);

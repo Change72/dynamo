@@ -175,24 +175,12 @@ def maybe_inject_plan(
         )
         return False
 
-    from vllm.v1.kv_offload.remote_g2.data_model import REMOTE_KV_REUSE_PLAN_VERSION
-
+    source_control_endpoint = dict(peers)[chosen_peer_worker_id]
     plan = {
-        "plan_id": f"router-shim-{request_id}",
         "request_id": str(request_id),
-        "target_worker_id": int(self_worker_id),
-        "target_dp_rank": 0,
-        "source_worker_id": int(chosen_peer_worker_id),
-        "source_dp_rank": 0,
-        "source_tier": "host_pinned",
+        "source_control_endpoint": source_control_endpoint,
         "block_hashes": plan_hashes,
-        "kv_block_hashes": [],
         "start_block_index": 0,
-        "planned_prefix_blocks": len(plan_hashes),
-        "block_size_tokens": 16,
-        "created_at_ms": 0,
-        "expires_at_ms": 10**15,
-        "plan_version": REMOTE_KV_REUSE_PLAN_VERSION,
     }
 
     if sampling_params.extra_args is None:
@@ -200,10 +188,8 @@ def maybe_inject_plan(
     kv_params = sampling_params.extra_args.setdefault("kv_transfer_params", {})
     kv_params["remote_g2_plan"] = plan
     logger.info(
-        "kvp2p plan_inject: attached plan for req=%s target=%d source=%d, "
-        "n_hashes=%d",
+        "kvp2p plan_inject: attached plan for req=%s source=%d, n_hashes=%d",
         request_id,
-        self_worker_id,
         chosen_peer_worker_id,
         len(plan_hashes),
     )

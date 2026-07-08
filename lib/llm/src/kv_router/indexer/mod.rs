@@ -200,7 +200,7 @@ impl Indexer {
     /// Walk the host-pinned (lower-tier) prefix chain for `source` starting
     /// from `parent_hash`, returning the source-side block hashes for the
     /// given token-block hashes. Used by the remote-G2 reuse planner to
-    /// populate a plan's `kv_block_hashes`. Returns empty for remote/none
+    /// populate a plan's external `block_hashes`. Returns empty for remote/none
     /// indexers or when no host-pinned tier exists.
     pub fn chain_block_hashes_for_host_pinned(
         &self,
@@ -1150,7 +1150,14 @@ mod tests {
         let worker = WorkerWithDpRank::new(7, 0);
 
         indexer
-            .apply_event(store_event(7, 0, 1, &[], &[11, 12, 13], StorageTier::Device))
+            .apply_event(store_event(
+                7,
+                0,
+                1,
+                &[],
+                &[11, 12, 13],
+                StorageTier::Device,
+            ))
             .await;
         indexer
             .apply_event(store_event(
@@ -1199,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn native_remote_g2_plan_emitted_from_real_query() {
         use dynamo_kv_router::remote_g2_plan::{
-            select_remote_g2_reuse_plan, RemoteKvReuseDecision, RemoteKvReuseSelectionInput,
+            RemoteKvReuseDecision, RemoteKvReuseSelectionInput, select_remote_g2_reuse_plan,
         };
 
         let indexer = make_test_concurrent_indexer();
@@ -1207,7 +1214,14 @@ mod tests {
         let target = WorkerWithDpRank::new(9, 0); // has never seen the prefix
 
         indexer
-            .apply_event(store_event(7, 0, 1, &[], &[11, 12, 13], StorageTier::Device))
+            .apply_event(store_event(
+                7,
+                0,
+                1,
+                &[],
+                &[11, 12, 13],
+                StorageTier::Device,
+            ))
             .await;
         indexer
             .apply_event(store_event(
@@ -1221,11 +1235,7 @@ mod tests {
             .await;
         flush_indexer(&indexer).await;
 
-        let block_hashes = vec![
-            LocalBlockHash(11),
-            LocalBlockHash(12),
-            LocalBlockHash(13),
-        ];
+        let block_hashes = vec![LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)];
         let matches = indexer
             .find_matches_by_tier(block_hashes.clone())
             .await
@@ -1240,29 +1250,23 @@ mod tests {
         assert_eq!(hp.hits.get(&source).copied().unwrap_or(0), 0);
         assert_eq!(hp.cross_worker_hits.get(&source).copied().unwrap_or(0), 3);
 
-        // The REAL router predicate, fed the REAL tiered matches, emits a plan:
-        // target 9 pulls source 7's host-pinned prefix.
+        // The REAL router predicate, fed the REAL tiered matches, emits a
+        // candidate: target 9 pulls source 7's host-pinned prefix.
         let decision = select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
             request_id: "native-real-query",
             target,
             block_hashes: &block_hashes,
-            block_size_tokens: 16,
             tiered_matches: &matches,
-            created_at_ms: 1000,
-            expires_at_ms: 2000,
         });
         match decision {
-            RemoteKvReuseDecision::Plan { plan, .. } => {
-                assert_eq!(plan.source_worker_id, source.worker_id);
-                assert_eq!(plan.target_worker_id, target.worker_id);
+            RemoteKvReuseDecision::Candidate { candidate, .. } => {
+                assert_eq!(candidate.source, source);
                 assert!(
-                    plan.planned_prefix_blocks > 0,
-                    "router must emit a non-empty cross-worker plan from the real \
-                     query (got {} blocks)",
-                    plan.planned_prefix_blocks
+                    !candidate.routing_block_hashes.is_empty(),
+                    "router must emit a non-empty cross-worker candidate from the real query"
                 );
             }
-            other => panic!("expected a remote-G2 plan from the real query, got {other:?}"),
+            other => panic!("expected a remote-G2 candidate from the real query, got {other:?}"),
         }
     }
 

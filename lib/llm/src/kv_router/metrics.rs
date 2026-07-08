@@ -756,15 +756,17 @@ impl RouterRequestMetrics {
 
     pub fn observe_remote_g2_decision(&self, decision: &RemoteKvReuseDecision, block_size: u32) {
         match decision {
+            RemoteKvReuseDecision::Candidate { candidate, stats } => {
+                self.remote_g2_plans_total.inc();
+                self.remote_g2_planned_tokens
+                    .inc_by(candidate.routing_block_hashes.len() as u64 * u64::from(block_size));
+                self.remote_g2_rejected_g1_candidates_total
+                    .inc_by(u64::from(stats.rejected_g1_candidates));
+            }
             RemoteKvReuseDecision::Plan { plan, stats } => {
                 self.remote_g2_plans_total.inc();
-                let block_size_tokens = if plan.block_size_tokens == 0 {
-                    block_size
-                } else {
-                    plan.block_size_tokens
-                };
                 self.remote_g2_planned_tokens
-                    .inc_by(u64::from(plan.planned_prefix_blocks) * u64::from(block_size_tokens));
+                    .inc_by(plan.block_hashes.len() as u64 * u64::from(block_size));
                 self.remote_g2_rejected_g1_candidates_total
                     .inc_by(u64::from(stats.rejected_g1_candidates));
             }
