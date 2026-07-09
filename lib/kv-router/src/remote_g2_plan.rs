@@ -727,6 +727,36 @@ mod tests {
     }
 
     #[test]
+    fn materialize_preserves_source_control_endpoint() {
+        let hashes = block_hashes(5);
+        let target = WorkerWithDpRank::new(9, 0);
+        let source = WorkerWithDpRank::new(7, 0);
+        let matches = tiered_matches(&[(target, 2)], &[(source, 5)]);
+        let mut selected = select_remote_g2_reuse_plan(selection_input(target, &hashes, &matches));
+        let RemoteKvReuseDecision::Plan { plan, .. } = &mut selected else {
+            panic!("fixture must select a plan");
+        };
+        plan.source_control_endpoint = Some("tcp://source:23280".to_string());
+
+        let decision = materialize_remote_g2_reuse_plan(selected, &hashes, |_, _, requested| {
+            assert_eq!(requested, hashes.as_slice());
+            (100..105).map(ExternalSequenceBlockHash).collect()
+        });
+
+        match decision {
+            RemoteKvReuseDecision::Plan { plan, .. } => {
+                assert_eq!(
+                    plan.source_control_endpoint.as_deref(),
+                    Some("tcp://source:23280")
+                );
+                assert_eq!(plan.block_hashes, hashes[2..]);
+                assert_eq!(plan.kv_block_hashes, vec![102, 103, 104]);
+            }
+            other => panic!("expected a materialized plan, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn materialize_inconsistent_plan_window_fails_before_resolver() {
         let hashes = block_hashes(5);
         let target = WorkerWithDpRank::new(9, 0);
