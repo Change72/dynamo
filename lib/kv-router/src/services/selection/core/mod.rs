@@ -487,6 +487,11 @@ impl SelectionCore {
                     },
                 )?;
             }
+            let control_endpoint = record
+                .kv_control_endpoints
+                .get(&dp_rank)
+                .cloned()
+                .or_else(|| record.kv_control_endpoint.clone());
             self.indexer_registry
                 .register(
                     record.worker_id,
@@ -496,6 +501,7 @@ impl SelectionCore {
                     record.tenant_id.clone(),
                     block_size,
                     record.replay_endpoint.clone(),
+                    control_endpoint,
                 )
                 .await
                 .map_err(|error| SelectionError::BadRequest(error.to_string()))?;
