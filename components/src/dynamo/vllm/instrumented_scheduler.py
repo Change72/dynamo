@@ -324,7 +324,10 @@ class InstrumentedScheduler(AsyncScheduler):
             return True
         return super().has_requests()
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, *args, **kwargs) -> SchedulerOutput:
+        # Newer vLLM passes throttle_prefills positionally; stash and forward
+        # so this wrapper works across scheduler signature changes.
+        self._schedule_fwd_args = (args, kwargs)
         if self._bench_active and self._bench_phase != _BenchPhase.IDLE:
             try:
                 output = self._bench_step()
@@ -379,7 +382,8 @@ class InstrumentedScheduler(AsyncScheduler):
         return self._schedule_and_record_time()
 
     def _schedule_and_record_time(self) -> SchedulerOutput:
-        output = super().schedule()
+        args, kwargs = getattr(self, "_schedule_fwd_args", ((), {}))
+        output = super().schedule(*args, **kwargs)
         if output.total_num_scheduled_tokens > 0:
             self._schedule_times.append(time.monotonic())
         return output
