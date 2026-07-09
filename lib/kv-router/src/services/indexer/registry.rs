@@ -420,7 +420,7 @@ impl WorkerRegistry {
         tenant_id: String,
         block_size: u32,
         replay_endpoint: Option<String>,
-        control_endpoint: Option<String>,
+        kv_control_endpoint: Option<String>,
     ) -> Result<()> {
         let key = IndexerKey {
             model_name,
@@ -497,7 +497,7 @@ impl WorkerRegistry {
                     control_endpoints: HashMap::new(),
                 });
             entry.listeners.insert(dp_rank, record.clone());
-            if let Some(endpoint) = control_endpoint {
+            if let Some(endpoint) = kv_control_endpoint {
                 entry.control_endpoints.insert(dp_rank, endpoint);
             }
         }

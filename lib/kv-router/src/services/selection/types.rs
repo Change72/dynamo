@@ -234,6 +234,18 @@ impl WorkerCatalogRecord {
         }
     }
 
+    pub(super) fn kv_control_endpoint_for_rank(&self, dp_rank: u32) -> Option<String> {
+        self.kv_control_endpoints
+            .get(&dp_rank)
+            .cloned()
+            .or_else(
+                || match (self.dp_size(), self.kv_control_endpoint.clone()) {
+                    (1, Some(endpoint)) if dp_rank == self.dp_start() => Some(endpoint),
+                    _ => None,
+                },
+            )
+    }
+
     pub(super) fn missing_schedulable_metadata(
         &self,
         queueing_enabled: bool,

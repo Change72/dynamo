@@ -496,6 +496,7 @@ impl SelectionCore {
                     record.tenant_id.clone(),
                     block_size,
                     record.replay_endpoint.clone(),
+                    record.kv_control_endpoint_for_rank(dp_rank),
                 )
                 .await
                 .map_err(|error| SelectionError::BadRequest(error.to_string()))?;
