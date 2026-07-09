@@ -136,23 +136,43 @@ fn remote_g2_reuse_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn demote_remote_g2_decision(
+    decision: RemoteKvReuseDecision,
+    reason: RemoteKvReuseNoPlanReason,
+) -> RemoteKvReuseDecision {
+    let mut stats = decision.stats();
+    // A demoted plan was not selected for execution, even if classification
+    // found a strict opportunity before the fail-closed gate.
+    stats.selected_opportunity_blocks = 0;
+    RemoteKvReuseDecision::NoPlan { reason, stats }
+}
+
 pub(crate) fn attach_remote_kv_reuse_decision(
     request: &mut PreprocessedRequest,
     decision: &RemoteKvReuseDecision,
-) -> serde_json::Result<()> {
+) -> serde_json::Result<RemoteKvReuseAttachmentOutcome> {
     match decision {
         RemoteKvReuseDecision::Plan { plan, .. } => {
             if request.attach_remote_kv_reuse_plan(plan).is_ok() {
-                return Ok(());
+                return Ok(RemoteKvReuseAttachmentOutcome::PlanAttached);
             }
             request.attach_remote_kv_reuse_no_plan_reason(
                 RemoteKvReuseNoPlanReason::SerializationFailed,
-            )
+            )?;
+            Ok(RemoteKvReuseAttachmentOutcome::PlanSerializationFailed)
         }
         RemoteKvReuseDecision::NoPlan { reason, .. } => {
-            request.attach_remote_kv_reuse_no_plan_reason(reason.clone())
+            request.attach_remote_kv_reuse_no_plan_reason(reason.clone())?;
+            Ok(RemoteKvReuseAttachmentOutcome::NoPlanAttached)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteKvReuseAttachmentOutcome {
+    PlanAttached,
+    PlanSerializationFailed,
+    NoPlanAttached,
 }
 
 // [gluo TODO] shouldn't need to be public
@@ -627,50 +647,52 @@ where
         // worker as the target and the retained tiered matches to find a remote
         // host-pinned source. Always produces a decision (NoPlan when disabled).
         let created_at_ms = unix_epoch_ms();
-        let mut remote_kv_reuse =
-            if remote_g2_reuse_enabled() && self.indexer.supports_remote_g2_materialization() {
-                select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
-                    request_id: context_id.unwrap_or_default(),
-                    target: response.best_worker,
-                    block_hashes: &g2_block_hashes,
-                    block_size_tokens: self.block_size,
-                    tiered_matches: &tiered_matches,
-                    created_at_ms,
-                    expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
-                })
+        let mut remote_kv_reuse = if self.indexer.supports_remote_g2_materialization() {
+            let classified = select_remote_g2_reuse_plan(RemoteKvReuseSelectionInput {
+                request_id: context_id.unwrap_or_default(),
+                target: response.best_worker,
+                block_hashes: &g2_block_hashes,
+                block_size_tokens: self.block_size,
+                tiered_matches: &tiered_matches,
+                created_at_ms,
+                expires_at_ms: created_at_ms.saturating_add(REMOTE_KV_REUSE_PLAN_TTL_MS),
+            });
+            if remote_g2_reuse_enabled() {
+                classified
             } else {
-                RemoteKvReuseDecision::NoPlan {
-                    reason: RemoteKvReuseNoPlanReason::Disabled,
-                    stats: RemoteKvReuseSelectionStats::default(),
-                }
-            };
+                demote_remote_g2_decision(classified, RemoteKvReuseNoPlanReason::Disabled)
+            }
+        } else {
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::Disabled,
+                stats: RemoteKvReuseSelectionStats::default(),
+            }
+        };
 
         // KVCC resolves the source from the Router-advertised per-DP control
         // endpoint. Preserve Moein's endpoint contract while using the exact
         // target-relative span selected above. A plan without a live endpoint
         // must fail closed before attempting local chain materialization.
-        let mut missing_control_endpoint_stats = None;
-        if let RemoteKvReuseDecision::Plan {
-            plan,
-            stats: plan_stats,
-            ..
-        } = &mut remote_kv_reuse
-        {
-            let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
-                plan.source_worker_id,
-                plan.source_dp_rank,
-            );
-            if let Some(endpoint) = self.control_endpoint(source) {
-                plan.source_control_endpoint = Some(endpoint);
+        let missing_control_endpoint =
+            if let RemoteKvReuseDecision::Plan { plan, .. } = &mut remote_kv_reuse {
+                let source = dynamo_kv_router::protocols::WorkerWithDpRank::new(
+                    plan.source_worker_id,
+                    plan.source_dp_rank,
+                );
+                if let Some(endpoint) = self.control_endpoint(source) {
+                    plan.source_control_endpoint = Some(endpoint);
+                    false
+                } else {
+                    true
+                }
             } else {
-                missing_control_endpoint_stats = Some(*plan_stats);
-            }
-        }
-        if let Some(stats) = missing_control_endpoint_stats {
-            remote_kv_reuse = RemoteKvReuseDecision::NoPlan {
-                reason: RemoteKvReuseNoPlanReason::NoSourceControlEndpoint,
-                stats,
+                false
             };
+        if missing_control_endpoint {
+            remote_kv_reuse = demote_remote_g2_decision(
+                remote_kv_reuse,
+                RemoteKvReuseNoPlanReason::NoSourceControlEndpoint,
+            );
         }
 
         // Post-selection materialization uses the exact span selected above;
@@ -1237,14 +1259,65 @@ mod tests {
 
     use async_trait::async_trait;
     use dynamo_kv_router::{
-        indexer::{LowerTierMatchDetails, MatchDetails},
+        indexer::{CrossWorkerSpan, LowerTierMatchDetails, MatchDetails},
         protocols::{OverlapScores, StorageTier, compute_seq_hash_for_block},
+        remote_g2_plan::{REMOTE_KV_REUSE_PLAN_VERSION, RemoteKvReusePlan},
     };
     use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
     use tokio::sync::watch;
 
     use crate::kv_router::scheduler::KvSchedulerError;
     use crate::local_model::runtime_config::ModelRuntimeConfig;
+
+    #[test]
+    fn remote_g2_demotion_preserves_opportunity_stats_and_clears_selection() {
+        let original_stats = RemoteKvReuseSelectionStats {
+            rejected_g1_candidates: 2,
+            raw_remote_candidate: true,
+            opportunity_blocks: 3,
+            selected_opportunity_blocks: 2,
+            target_local_prefix_blocks: 4,
+        };
+        let decision = RemoteKvReuseDecision::Plan {
+            plan: RemoteKvReusePlan {
+                plan_id: "plan-1".to_string(),
+                request_id: "request-1".to_string(),
+                target_worker_id: 9,
+                target_dp_rank: 0,
+                source_worker_id: 7,
+                source_dp_rank: 0,
+                source_control_endpoint: None,
+                source_tier: StorageTier::HostPinned,
+                block_hashes: vec![LocalBlockHash(11), LocalBlockHash(22)],
+                start_block_index: 2,
+                planned_prefix_blocks: 2,
+                block_size_tokens: 16,
+                created_at_ms: 1000,
+                expires_at_ms: 2000,
+                plan_version: REMOTE_KV_REUSE_PLAN_VERSION,
+                kv_block_hashes: vec![101, 102],
+            },
+            stats: original_stats,
+            selected_span: CrossWorkerSpan {
+                start_pos: 0,
+                end_pos: 4,
+                parent_hash: None,
+            },
+        };
+
+        let demoted = demote_remote_g2_decision(decision, RemoteKvReuseNoPlanReason::Disabled);
+
+        assert_eq!(
+            demoted,
+            RemoteKvReuseDecision::NoPlan {
+                reason: RemoteKvReuseNoPlanReason::Disabled,
+                stats: RemoteKvReuseSelectionStats {
+                    selected_opportunity_blocks: 0,
+                    ..original_stats
+                },
+            }
+        );
+    }
 
     #[test]
     fn weighted_cache_hit_estimates_include_lower_tiers() {

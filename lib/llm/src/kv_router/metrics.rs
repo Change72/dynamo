@@ -607,8 +607,16 @@ pub struct RouterRequestMetrics {
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
+    pub remote_g2_decisions_total: prometheus::IntCounter,
+    pub remote_g2_raw_candidates_total: prometheus::IntCounter,
+    pub remote_g2_opportunities_total: prometheus::IntCounter,
+    pub remote_g2_opportunity_tokens: prometheus::IntCounter,
     pub remote_g2_plans_total: prometheus::IntCounter,
     pub remote_g2_planned_tokens: prometheus::IntCounter,
+    pub remote_g2_plans_attached_total: prometheus::IntCounter,
+    pub remote_g2_plans_attached_on_opportunity_total: prometheus::IntCounter,
+    pub remote_g2_plans_attached_without_opportunity_total: prometheus::IntCounter,
+    pub remote_g2_plan_attachment_failures_total: prometheus::IntCounter,
     pub remote_g2_rejected_g1_candidates_total: prometheus::IntCounter,
     pub remote_g2_no_plan_total: IntCounterVec,
 }
@@ -706,10 +714,38 @@ impl RouterRequestMetrics {
                         Some(prometheus::exponential_buckets(1.0, 2.0, 12).unwrap()),
                     )
                     .expect("failed to create router_shared_cache_beyond_blocks");
+                let remote_g2_decisions_total = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_decisions_total"),
+                        "Total post-target-selection Remote-G2 decisions",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_remote_g2_decisions_total");
+                let remote_g2_raw_candidates_total = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_raw_candidates_total"),
+                        "Total decisions with any non-target host-pinned KV candidate",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_remote_g2_raw_candidates_total");
+                let remote_g2_opportunities_total = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_opportunities_total"),
+                        "Total decisions with a contiguous non-target span beyond the target's complete local G1+G2 prefix",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_remote_g2_opportunities_total");
+                let remote_g2_opportunity_tokens = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_opportunity_tokens"),
+                        "Total prompt tokens reusable from the best strict Remote-G2 opportunity",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_remote_g2_opportunity_tokens");
                 let remote_g2_plans_total = metrics
                     .create_intcounter(
                         &router_metric("remote_g2_plans_total"),
-                        "Total remote G2 reuse plans attached by the router",
+                        "Total remote G2 reuse plans selected before request attachment",
                         extra_labels,
                     )
                     .expect("failed to create router_remote_g2_plans_total");
@@ -720,6 +756,38 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_remote_g2_planned_tokens");
+                let remote_g2_plans_attached_total = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_plans_attached_total"),
+                        "Total selected Remote-G2 plans successfully attached to requests",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_remote_g2_plans_attached_total");
+                let remote_g2_plans_attached_on_opportunity_total = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_plans_attached_on_opportunity_total"),
+                        "Total attached plans whose exact materialized source span extends beyond the target's complete local G1+G2 prefix",
+                        extra_labels,
+                    )
+                    .expect(
+                        "failed to create router_remote_g2_plans_attached_on_opportunity_total",
+                    );
+                let remote_g2_plans_attached_without_opportunity_total = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_plans_attached_without_opportunity_total"),
+                        "Total attached plans whose exact materialized source span does not use a strict Remote-G2 opportunity",
+                        extra_labels,
+                    )
+                    .expect(
+                        "failed to create router_remote_g2_plans_attached_without_opportunity_total",
+                    );
+                let remote_g2_plan_attachment_failures_total = metrics
+                    .create_intcounter(
+                        &router_metric("remote_g2_plan_attachment_failures_total"),
+                        "Total selected Remote-G2 plans that failed request attachment",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_remote_g2_plan_attachment_failures_total");
                 let remote_g2_rejected_g1_candidates_total = metrics
                     .create_intcounter(
                         &router_metric("remote_g2_rejected_g1_candidates_total"),
@@ -745,8 +813,16 @@ impl RouterRequestMetrics {
                     kv_transfer_estimated_latency_seconds,
                     shared_cache_hit_rate,
                     shared_cache_beyond_blocks,
+                    remote_g2_decisions_total,
+                    remote_g2_raw_candidates_total,
+                    remote_g2_opportunities_total,
+                    remote_g2_opportunity_tokens,
                     remote_g2_plans_total,
                     remote_g2_planned_tokens,
+                    remote_g2_plans_attached_total,
+                    remote_g2_plans_attached_on_opportunity_total,
+                    remote_g2_plans_attached_without_opportunity_total,
+                    remote_g2_plan_attachment_failures_total,
                     remote_g2_rejected_g1_candidates_total,
                     remote_g2_no_plan_total,
                 })
@@ -755,6 +831,16 @@ impl RouterRequestMetrics {
     }
 
     pub fn observe_remote_g2_decision(&self, decision: &RemoteKvReuseDecision, block_size: u32) {
+        self.remote_g2_decisions_total.inc();
+        let stats = decision.stats();
+        if stats.raw_remote_candidate {
+            self.remote_g2_raw_candidates_total.inc();
+        }
+        if stats.opportunity_blocks > 0 {
+            self.remote_g2_opportunities_total.inc();
+            self.remote_g2_opportunity_tokens
+                .inc_by(u64::from(stats.opportunity_blocks) * u64::from(block_size));
+        }
         match decision {
             RemoteKvReuseDecision::Plan { plan, stats, .. } => {
                 self.remote_g2_plans_total.inc();
@@ -775,6 +861,23 @@ impl RouterRequestMetrics {
                 self.remote_g2_rejected_g1_candidates_total
                     .inc_by(u64::from(stats.rejected_g1_candidates));
             }
+        }
+    }
+
+    pub fn observe_remote_g2_attachment(&self, decision: &RemoteKvReuseDecision, attached: bool) {
+        let RemoteKvReuseDecision::Plan { stats, .. } = decision else {
+            return;
+        };
+        if attached {
+            self.remote_g2_plans_attached_total.inc();
+            if stats.selected_opportunity_blocks > 0 {
+                self.remote_g2_plans_attached_on_opportunity_total.inc();
+            } else {
+                self.remote_g2_plans_attached_without_opportunity_total
+                    .inc();
+            }
+        } else {
+            self.remote_g2_plan_attachment_failures_total.inc();
         }
     }
 }
@@ -830,6 +933,14 @@ impl RemoteIndexerMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dynamo_kv_router::{
+        indexer::CrossWorkerSpan,
+        protocols::{LocalBlockHash, StorageTier},
+        remote_g2_plan::{
+            REMOTE_KV_REUSE_PLAN_VERSION, RemoteKvReuseNoPlanReason, RemoteKvReusePlan,
+            RemoteKvReuseSelectionStats,
+        },
+    };
     use prometheus::{Encoder, TextEncoder};
 
     fn gather_pef(registry: &prometheus::Registry) -> String {
@@ -837,6 +948,222 @@ mod tests {
         let mut buffer = Vec::new();
         encoder.encode(&registry.gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
+    }
+
+    fn test_router_request_metrics() -> (RouterRequestMetrics, prometheus::Registry) {
+        let histogram = |name: &str| {
+            prometheus::Histogram::with_opts(HistogramOpts::new(
+                format!("test_{name}"),
+                "test histogram",
+            ))
+            .unwrap()
+        };
+        let counter = |name: &str| IntCounter::new(name, "test counter").unwrap();
+        let metrics = RouterRequestMetrics {
+            requests_total: counter("test_requests_total"),
+            time_to_first_token_seconds: histogram("time_to_first_token_seconds"),
+            inter_token_latency_seconds: histogram("inter_token_latency_seconds"),
+            input_sequence_tokens: histogram("input_sequence_tokens"),
+            output_sequence_tokens: histogram("output_sequence_tokens"),
+            kv_hit_rate: histogram("kv_hit_rate"),
+            kv_transfer_estimated_latency_seconds: histogram(
+                "kv_transfer_estimated_latency_seconds",
+            ),
+            shared_cache_hit_rate: histogram("shared_cache_hit_rate"),
+            shared_cache_beyond_blocks: histogram("shared_cache_beyond_blocks"),
+            remote_g2_decisions_total: counter("remote_g2_decisions_total"),
+            remote_g2_raw_candidates_total: counter("remote_g2_raw_candidates_total"),
+            remote_g2_opportunities_total: counter("remote_g2_opportunities_total"),
+            remote_g2_opportunity_tokens: counter("remote_g2_opportunity_tokens"),
+            remote_g2_plans_total: counter("remote_g2_plans_total"),
+            remote_g2_planned_tokens: counter("remote_g2_planned_tokens"),
+            remote_g2_plans_attached_total: counter("remote_g2_plans_attached_total"),
+            remote_g2_plans_attached_on_opportunity_total: counter(
+                "remote_g2_plans_attached_on_opportunity_total",
+            ),
+            remote_g2_plans_attached_without_opportunity_total: counter(
+                "remote_g2_plans_attached_without_opportunity_total",
+            ),
+            remote_g2_plan_attachment_failures_total: counter(
+                "remote_g2_plan_attachment_failures_total",
+            ),
+            remote_g2_rejected_g1_candidates_total: counter(
+                "remote_g2_rejected_g1_candidates_total",
+            ),
+            remote_g2_no_plan_total: IntCounterVec::new(
+                Opts::new("remote_g2_no_plan_total", "test no-plan counter"),
+                &["reason"],
+            )
+            .unwrap(),
+        };
+        let registry = prometheus::Registry::new();
+        for metric in [
+            &metrics.remote_g2_decisions_total,
+            &metrics.remote_g2_raw_candidates_total,
+            &metrics.remote_g2_opportunities_total,
+            &metrics.remote_g2_opportunity_tokens,
+            &metrics.remote_g2_plans_total,
+            &metrics.remote_g2_planned_tokens,
+            &metrics.remote_g2_plans_attached_total,
+            &metrics.remote_g2_plans_attached_on_opportunity_total,
+            &metrics.remote_g2_plans_attached_without_opportunity_total,
+            &metrics.remote_g2_plan_attachment_failures_total,
+            &metrics.remote_g2_rejected_g1_candidates_total,
+        ] {
+            registry.register(Box::new(metric.clone())).unwrap();
+        }
+        registry
+            .register(Box::new(metrics.remote_g2_no_plan_total.clone()))
+            .unwrap();
+        (metrics, registry)
+    }
+
+    fn test_remote_g2_plan(selected_opportunity_blocks: u32) -> RemoteKvReuseDecision {
+        RemoteKvReuseDecision::Plan {
+            plan: RemoteKvReusePlan {
+                plan_id: "plan-1".to_string(),
+                request_id: "request-1".to_string(),
+                target_worker_id: 9,
+                target_dp_rank: 0,
+                source_worker_id: 7,
+                source_dp_rank: 0,
+                source_control_endpoint: Some("tcp://source:23280".to_string()),
+                source_tier: StorageTier::HostPinned,
+                block_hashes: vec![LocalBlockHash(11), LocalBlockHash(22)],
+                start_block_index: 2,
+                planned_prefix_blocks: 2,
+                block_size_tokens: 16,
+                created_at_ms: 1000,
+                expires_at_ms: 2000,
+                plan_version: REMOTE_KV_REUSE_PLAN_VERSION,
+                kv_block_hashes: vec![101, 102],
+            },
+            stats: RemoteKvReuseSelectionStats {
+                rejected_g1_candidates: 2,
+                raw_remote_candidate: true,
+                opportunity_blocks: 3,
+                selected_opportunity_blocks,
+                target_local_prefix_blocks: 4,
+            },
+            selected_span: CrossWorkerSpan {
+                start_pos: 0,
+                end_pos: 4,
+                parent_hash: None,
+            },
+        }
+    }
+
+    #[test]
+    fn remote_g2_enabled_plan_updates_opportunity_and_attachment_funnel() {
+        let (metrics, registry) = test_router_request_metrics();
+        let decision = test_remote_g2_plan(1);
+
+        metrics.observe_remote_g2_decision(&decision, 16);
+        metrics.observe_remote_g2_attachment(&decision, true);
+
+        assert_eq!(metrics.remote_g2_decisions_total.get(), 1);
+        assert_eq!(metrics.remote_g2_raw_candidates_total.get(), 1);
+        assert_eq!(metrics.remote_g2_opportunities_total.get(), 1);
+        assert_eq!(metrics.remote_g2_opportunity_tokens.get(), 48);
+        assert_eq!(metrics.remote_g2_plans_total.get(), 1);
+        assert_eq!(metrics.remote_g2_planned_tokens.get(), 32);
+        assert_eq!(metrics.remote_g2_plans_attached_total.get(), 1);
+        assert_eq!(
+            metrics.remote_g2_plans_attached_on_opportunity_total.get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .remote_g2_plans_attached_without_opportunity_total
+                .get(),
+            0
+        );
+        assert_eq!(metrics.remote_g2_plan_attachment_failures_total.get(), 0);
+        assert_eq!(metrics.remote_g2_rejected_g1_candidates_total.get(), 2);
+
+        let output = gather_pef(&registry);
+        assert!(output.contains("remote_g2_opportunity_tokens 48"));
+        assert!(output.contains("remote_g2_plans_attached_total 1"));
+    }
+
+    #[test]
+    fn remote_g2_disabled_decision_still_records_opportunity() {
+        let (metrics, registry) = test_router_request_metrics();
+        let decision = RemoteKvReuseDecision::NoPlan {
+            reason: RemoteKvReuseNoPlanReason::Disabled,
+            stats: RemoteKvReuseSelectionStats {
+                rejected_g1_candidates: 2,
+                raw_remote_candidate: true,
+                opportunity_blocks: 3,
+                selected_opportunity_blocks: 0,
+                target_local_prefix_blocks: 4,
+            },
+        };
+
+        metrics.observe_remote_g2_decision(&decision, 16);
+        metrics.observe_remote_g2_attachment(&decision, false);
+
+        assert_eq!(metrics.remote_g2_decisions_total.get(), 1);
+        assert_eq!(metrics.remote_g2_raw_candidates_total.get(), 1);
+        assert_eq!(metrics.remote_g2_opportunities_total.get(), 1);
+        assert_eq!(metrics.remote_g2_opportunity_tokens.get(), 48);
+        assert_eq!(metrics.remote_g2_plans_total.get(), 0);
+        assert_eq!(metrics.remote_g2_planned_tokens.get(), 0);
+        assert_eq!(metrics.remote_g2_plans_attached_total.get(), 0);
+        assert_eq!(
+            metrics.remote_g2_plans_attached_on_opportunity_total.get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .remote_g2_plans_attached_without_opportunity_total
+                .get(),
+            0
+        );
+        assert_eq!(metrics.remote_g2_plan_attachment_failures_total.get(), 0);
+        assert_eq!(
+            metrics
+                .remote_g2_no_plan_total
+                .with_label_values(&["disabled"])
+                .get(),
+            1
+        );
+
+        let output = gather_pef(&registry);
+        assert!(output.contains("remote_g2_no_plan_total{reason=\"disabled\"} 1"));
+    }
+
+    #[test]
+    fn remote_g2_attachment_counters_distinguish_failure_and_non_opportunity() {
+        let (metrics, _) = test_router_request_metrics();
+
+        metrics.observe_remote_g2_attachment(&test_remote_g2_plan(1), false);
+        assert_eq!(metrics.remote_g2_plan_attachment_failures_total.get(), 1);
+        assert_eq!(metrics.remote_g2_plans_attached_total.get(), 0);
+        assert_eq!(
+            metrics.remote_g2_plans_attached_on_opportunity_total.get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .remote_g2_plans_attached_without_opportunity_total
+                .get(),
+            0
+        );
+
+        metrics.observe_remote_g2_attachment(&test_remote_g2_plan(0), true);
+        assert_eq!(metrics.remote_g2_plan_attachment_failures_total.get(), 1);
+        assert_eq!(metrics.remote_g2_plans_attached_total.get(), 1);
+        assert_eq!(
+            metrics.remote_g2_plans_attached_on_opportunity_total.get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .remote_g2_plans_attached_without_opportunity_total
+                .get(),
+            1
+        );
     }
 
     #[test]
